@@ -1,0 +1,13 @@
+experiment:
+  name: phase1_data_inspection
+  phase: implementation_phase_1
+
+data:
+  root: /Users/qianhu/博士论文/多角度聚类医学论文/SpaMGCL/Expert Systems SMGC/SMGC-data
+
+inspection:
+  datasets:
+    - Simulation
+    - HLN-A1
+    - E18.5
+
