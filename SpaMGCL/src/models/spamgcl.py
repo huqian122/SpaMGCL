@@ -53,8 +53,15 @@ class SpaMGCL(nn.Module):
         super().__init__()
         if len(input_dims) != 2:
             raise ValueError("SpaMGCL expects exactly two modalities")
+        self.modality_names = tuple(input_dims)
         self.gcn = GraphViewGCN(input_dims, hidden_dim=gcn_hidden_dim)
-        self.view_order = ("rna_spatial", "rna_feature", "adt_spatial", "adt_feature")
+        first_modality, second_modality = self.modality_names
+        self.view_order = (
+            f"{first_modality.lower()}_spatial",
+            f"{first_modality.lower()}_feature",
+            f"{second_modality.lower()}_spatial",
+            f"{second_modality.lower()}_feature",
+        )
         self.view_encoders = nn.ModuleDict(
             {
                 view_name: ViewMultiGranularityEncoder(
@@ -95,7 +102,11 @@ class SpaMGCL(nn.Module):
         modality_b_feature_adj: object,
         spatial_adjacency: object,
         alpha: Optional[float] = None,
+        modality_a_name: Optional[str] = None,
+        modality_b_name: Optional[str] = None,
     ) -> SpaMGCLForwardOutput:
+        modality_a_name = modality_a_name or self.modality_names[0]
+        modality_b_name = modality_b_name or self.modality_names[1]
         gcn_views = self.gcn(
             modality_a_features,
             modality_a_spatial_adj,
@@ -103,6 +114,8 @@ class SpaMGCL(nn.Module):
             modality_b_features,
             modality_b_spatial_adj,
             modality_b_feature_adj,
+            modality_a_name=modality_a_name,
+            modality_b_name=modality_b_name,
         )
 
         multigranularity_views: Dict[str, Dict[str, Tensor]] = {
