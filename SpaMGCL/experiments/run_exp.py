@@ -138,6 +138,11 @@ def _build_model_config(config: Mapping[str, Any], num_clusters: int) -> Dict[st
     model.setdefault("representation_dim", 32)
     model.setdefault("fusion_hidden_dim", 128)
     model.setdefault("alpha", 0.5)
+    # ``tau_s`` is the paper-facing name for the sample-level temperature.
+    # Translate it here so the model keeps its stable Python API.
+    tau_s = model.pop("tau_s", None)
+    if tau_s is not None:
+        model["temperature"] = float(tau_s)
     model.setdefault("temperature", 0.5)
     model.setdefault("cluster_temperature", 1.0)
     model.setdefault("cluster_regularization_weight", 1.0)
@@ -299,11 +304,37 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
     ).to(device)
     learning_rate = float(training_config.get("lr", config.get("lr", 1e-3)))
     weight_decay = float(training_config.get("weight_decay", config.get("weight_decay", 1e-5)))
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+    cluster_head_multiplier = float(
+        training_config.get("cluster_head_lr_multiplier", 8.0)
+    )
+    if learning_rate <= 0 or cluster_head_multiplier <= 0:
+        raise ValueError("lr and cluster_head_lr_multiplier must be positive")
+    cluster_head_parameters = list(model.cluster_head.parameters())
+    cluster_head_parameter_ids = {id(parameter) for parameter in cluster_head_parameters}
+    backbone_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if id(parameter) not in cluster_head_parameter_ids
+    ]
+    optimizer = torch.optim.Adam(
+        [
+            {"params": backbone_parameters, "lr": learning_rate},
+            {
+                "params": cluster_head_parameters,
+                "lr": learning_rate * cluster_head_multiplier,
+            },
+        ],
+        weight_decay=weight_decay,
+    )
 
     print(f"Dataset: {dataset} | spots={sample.n_spots} | device={device}")
     print(f"Modalities: {', '.join(modality_names)} | label={sample.label_key}")
     print(f"Spatial graph: shape={spatial_adjacency.shape}, nnz={spatial_adjacency.nnz}")
+    print(
+        f"Learning rates: backbone={learning_rate:g} | "
+        f"cluster_head={learning_rate * cluster_head_multiplier:g} "
+        f"({cluster_head_multiplier:g}x)"
+    )
 
     history = []
     for epoch_index in range(epochs):

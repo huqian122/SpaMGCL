@@ -38,7 +38,7 @@ model:
   fusion_hidden_dim: 64
   num_clusters: 10
   alpha: 0.5
-  temperature: 0.5
+  tau_s: 0.3
   cluster_temperature: 1.0
   cluster_regularization_weight: 1.0
 
@@ -47,11 +47,12 @@ training:
   warm_up_epochs: 10
   lr: 0.001
   weight_decay: 0.00001
+  cluster_head_lr_multiplier: 8.0
 
 loss:
   lambda_rec: 1.0
   lambda_mgcl: 1.0
-  lambda_cluster: 1.0
+  lambda_cluster: 5.0
   lambda_spatial: 0.1
 
 clustering:
