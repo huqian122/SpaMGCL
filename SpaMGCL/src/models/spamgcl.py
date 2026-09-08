@@ -29,6 +29,8 @@ class SpaMGCLForwardOutput:
     spatial_consistency_scores: Tensor
     combined_distances: Tensor
     weights: Tensor
+    weighted_representation: Tensor
+    mean_representation: Tensor
     cluster_assignments: Sequence[Tensor]
     gcn_views: Dict[str, Tensor]
     multigranularity_views: Dict[str, Dict[str, Tensor]]
@@ -81,9 +83,10 @@ class SpaMGCL(nn.Module):
             fusion_hidden_dim=fusion_hidden_dim,
             alpha=alpha,
         )
-        # MGCMVC uses one label projection shared by all views. Sharing the
-        # head makes cluster index c mean the same thing in every Q_v.
-        self.cluster_head = ClusterHead(representation_dim, num_clusters)
+        # MGCMVC applies the shared cluster head to the fine-grained encoder
+        # output Z_v, before multigranularity fusion. This also keeps the
+        # implementation correct when fine_dim and representation_dim differ.
+        self.cluster_head = ClusterHead(fine_dim, num_clusters)
         self.reconstruction_loss = ReconstructionLoss()
         self.sample_contrastive_loss = AdaptiveSampleContrastiveLoss(temperature=temperature)
         self.cluster_contrastive_loss = ClusterContrastiveLoss(temperature=cluster_temperature)
@@ -145,7 +148,7 @@ class SpaMGCL(nn.Module):
             spatial_adjacency=spatial_adjacency,
         )
         assignments = [
-            self.cluster_head(multigranularity_views[view_name]["g"])
+            self.cluster_head(multigranularity_views[view_name]["z"])
             for view_name in self.view_order
         ]
         cluster_contrastive = self.cluster_contrastive_loss(
@@ -153,6 +156,11 @@ class SpaMGCL(nn.Module):
             regularization_weight=self.cluster_regularization_weight,
         )
         spatial_loss = self.spatial_regularization_loss(representations, spatial_adjacency)
+        stacked_representations = torch.stack(representations, dim=0)
+        weighted_representation = torch.sum(
+            weights[:, None, None] * stacked_representations, dim=0
+        )
+        mean_representation = stacked_representations.mean(dim=0)
 
         total = reconstruction + sample_contrastive + cluster_contrastive + spatial_loss
         return SpaMGCLForwardOutput(
@@ -166,6 +174,8 @@ class SpaMGCL(nn.Module):
             spatial_consistency_scores=spatial_consistency_scores,
             combined_distances=combined_distances,
             weights=weights,
+            weighted_representation=weighted_representation,
+            mean_representation=mean_representation,
             cluster_assignments=assignments,
             gcn_views=gcn_views,
             multigranularity_views=multigranularity_views,

@@ -130,6 +130,47 @@ def _gradient_norm(module: torch.nn.Module) -> float:
     return float(np.sqrt(squared_norm))
 
 
+def _embedding_from_output(output: Any, mode: str) -> torch.Tensor:
+    """Select the representation that is actually sent to clustering."""
+
+    mode = mode.lower()
+    if mode == "global":
+        return output.global_representation
+    if mode == "weighted_views":
+        return output.weighted_representation
+    if mode == "mean_views":
+        return output.mean_representation
+    if mode == "cluster_probabilities":
+        return torch.stack(list(output.cluster_assignments), dim=0).mean(dim=0)
+    if mode == "concat_views":
+        return torch.cat(
+            [output.multigranularity_views[name]["g"] for name in output.multigranularity_views],
+            dim=1,
+        )
+    raise ValueError(
+        "clustering.embedding must be one of: global, weighted_views, "
+        "mean_views, cluster_probabilities, concat_views"
+    )
+
+
+def _cluster_embedding(
+    embedding: np.ndarray,
+    n_clusters: int,
+    *,
+    method: str,
+    seed: int,
+) -> Tuple[np.ndarray, str]:
+    """Cluster a representation, including MGCMVC's direct Q argmax path."""
+
+    if method.lower() == "argmax":
+        if embedding.ndim != 2 or embedding.shape[1] != n_clusters:
+            raise ValueError(
+                "argmax clustering requires an N x n_clusters probability matrix"
+            )
+        return np.argmax(embedding, axis=1), "argmax"
+    return cluster_embedding(embedding, n_clusters, method=method, seed=seed)
+
+
 def _build_model_config(config: Mapping[str, Any], num_clusters: int) -> Dict[str, Any]:
     model = dict(_section(config, "model"))
     model.setdefault("gcn_hidden_dim", 64)
@@ -186,8 +227,11 @@ def _build_graphs(
 
 
 def _effective_loss_coefficients(
-    config: Mapping[str, Any], epoch_number: int, warm_up_epochs: int
-) -> Tuple[float, float, float, float, bool]:
+    config: Mapping[str, Any],
+    epoch_number: int,
+    warm_up_epochs: int,
+    spatial_start_epoch: Optional[int] = None,
+) -> Tuple[float, float, float, float, bool, bool]:
     loss = _section(config, "loss")
     lambda_rec = float(loss.get("lambda_rec", config.get("lambda_rec", 1.0)))
     lambda_mgcl = float(loss.get("lambda_mgcl", config.get("lambda_mgcl", 1.0)))
@@ -200,10 +244,24 @@ def _effective_loss_coefficients(
     if min(lambda_rec, lambda_mgcl, lambda_cluster, lambda_spatial) < 0:
         raise ValueError("loss coefficients must be nonnegative")
 
-    warm_up = epoch_number <= warm_up_epochs
-    if warm_up:
-        return lambda_rec, lambda_mgcl, 0.0, 0.0, False
-    return lambda_rec, lambda_mgcl, lambda_cluster, lambda_spatial, True
+    # Keep cluster activation and spatial regularization independently
+    # schedulable. The default preserves the old behavior, while P1 can
+    # delay spatial regularization to measure the MGCMVC structure first.
+    if spatial_start_epoch is None:
+        spatial_start_epoch = warm_up_epochs + 1
+    if spatial_start_epoch < 1:
+        raise ValueError("spatial_start_epoch must be positive")
+
+    cluster_enabled = epoch_number > warm_up_epochs
+    spatial_enabled = epoch_number >= spatial_start_epoch
+    return (
+        lambda_rec,
+        lambda_mgcl,
+        lambda_cluster if cluster_enabled else 0.0,
+        lambda_spatial if spatial_enabled else 0.0,
+        cluster_enabled,
+        spatial_enabled,
+    )
 
 
 def run_experiment(config_path: Path) -> Dict[str, Any]:
@@ -230,6 +288,11 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         raise ValueError("epochs must be positive")
     if warm_up_epochs < 0:
         raise ValueError("warm_up_epochs cannot be negative")
+    spatial_start_epoch = int(
+        training_config.get("spatial_start_epoch", warm_up_epochs + 1)
+    )
+    if spatial_start_epoch < 1:
+        raise ValueError("spatial_start_epoch must be positive")
 
     data_root = _resolve_path(data_config.get("root"), base=PROJECT_ROOT, field_name="data.root")
     label_key = data_config.get("label_key")
@@ -337,6 +400,8 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
     )
 
     history = []
+    cluster_head_init = str(training_config.get("cluster_head_init", "none")).lower()
+    cluster_head_initialized = False
     for epoch_index in range(epochs):
         epoch_number = epoch_index + 1
         model.train()
@@ -354,7 +419,14 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         coefficients = _effective_loss_coefficients(
             config, epoch_number, warm_up_epochs
         )
-        lambda_rec, lambda_mgcl, lambda_cluster, lambda_spatial, cluster_enabled = coefficients
+        (
+            lambda_rec,
+            lambda_mgcl,
+            lambda_cluster,
+            lambda_spatial,
+            cluster_enabled,
+            spatial_enabled,
+        ) = coefficients
         total_loss = (
             lambda_rec * output.reconstruction_loss
             + lambda_mgcl * output.sample_contrastive_loss
@@ -367,6 +439,21 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         total_loss.backward()
         cluster_head_gradient_norm = _gradient_norm(model.cluster_head)
         optimizer.step()
+
+        if (
+            not cluster_head_initialized
+            and cluster_head_init == "kmeans"
+            and epoch_number >= warm_up_epochs
+        ):
+            model.cluster_head.initialize_from_kmeans(
+                [
+                    output.multigranularity_views[view_name]["z"].detach()
+                    for view_name in model.view_order
+                ],
+                seed=seed,
+                temperature=float(model.cluster_contrastive_loss.temperature),
+            )
+            cluster_head_initialized = True
 
         cluster_diagnostics = model.cluster_contrastive_loss.diagnostics(
             output.cluster_assignments
@@ -384,6 +471,7 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             "lambda_cluster": lambda_cluster,
             "lambda_spatial": lambda_spatial,
             "cluster_enabled": cluster_enabled,
+            "spatial_enabled": spatial_enabled,
             "cluster_assignment_entropy": _json_float(
                 cluster_diagnostics["assignment_entropy"]
             ),
@@ -421,12 +509,51 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             modality_a_name=first_modality,
             modality_b_name=second_modality,
         )
-    embedding = final_output.global_representation.detach().cpu().numpy()
+    clustering_options = dict(clustering_config)
     method = str(clustering_config.get("method", "kmeans"))
-    predicted, method_used = cluster_embedding(
+    default_embedding = (
+        "cluster_probabilities" if method.lower() == "argmax" else "global"
+    )
+    embedding_mode = str(clustering_options.get("embedding", default_embedding))
+    embedding = _embedding_from_output(final_output, embedding_mode).detach().cpu().numpy()
+    predicted, method_used = _cluster_embedding(
         embedding, num_clusters, method=method, seed=seed
     )
     metrics = clustering_metrics(labels, predicted)
+    candidate_metrics: Dict[str, Any] = {}
+    for candidate_mode in (
+        "global",
+        "weighted_views",
+        "mean_views",
+        "cluster_probabilities",
+        "concat_views",
+    ):
+        candidate_embedding = _embedding_from_output(
+            final_output, candidate_mode
+        ).detach().cpu().numpy()
+        candidate_predicted, candidate_method = _cluster_embedding(
+            candidate_embedding,
+            num_clusters,
+            method="kmeans",
+            seed=seed,
+        )
+        candidate_metrics[candidate_mode] = {
+            "method": candidate_method,
+            **clustering_metrics(labels, candidate_predicted),
+        }
+    q_probabilities = _embedding_from_output(
+        final_output, "cluster_probabilities"
+    ).detach().cpu().numpy()
+    q_predicted, q_method = _cluster_embedding(
+        q_probabilities,
+        num_clusters,
+        method="argmax",
+        seed=seed,
+    )
+    candidate_metrics["cluster_argmax"] = {
+        "method": q_method,
+        **clustering_metrics(labels, q_predicted),
+    }
     final_cluster_diagnostics = model.cluster_contrastive_loss.diagnostics(
         final_output.cluster_assignments
     )
@@ -450,11 +577,17 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         "device": str(device),
         "epochs": epochs,
         "warm_up_epochs": warm_up_epochs,
+        "spatial_start_epoch": spatial_start_epoch,
         "cluster_enabled_epochs": [
             record["epoch"] for record in history if record["cluster_enabled"]
         ],
+        "spatial_enabled_epochs": [
+            record["epoch"] for record in history if record["spatial_enabled"]
+        ],
         "clustering_method_requested": method,
         "clustering_method_used": method_used,
+        "clustering_embedding": embedding_mode,
+        "candidate_metrics": candidate_metrics,
         "num_clusters": num_clusters,
         "ARI": metrics["ARI"],
         "NMI": metrics["NMI"],

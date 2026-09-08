@@ -10,7 +10,11 @@ import torch.nn.functional as F
 
 
 class ClusterHead(nn.Module):
-    """Map each ``G_v`` to soft cluster assignments ``Q_v``."""
+    """Map each view's clustering representation to soft assignments ``Q_v``.
+
+    In MGCMVC the clustering representation is the fine-grained encoder
+    output ``Z_v``; the caller is responsible for passing that representation.
+    """
 
     def __init__(self, input_dim: int, num_clusters: int) -> None:
         super().__init__()
@@ -22,6 +26,46 @@ class ClusterHead(nn.Module):
         if representation.ndim != 2:
             raise ValueError("representation must be 2D")
         return F.softmax(self.projection(representation), dim=1)
+
+    @torch.no_grad()
+    def initialize_from_kmeans(
+        self,
+        representations: Sequence[Tensor],
+        *,
+        seed: int = 0,
+        temperature: float = 1.0,
+    ) -> None:
+        """Initialize logits from unsupervised warm-up clusters.
+
+        The cluster loss is permutation-invariant but has a nearly uniform
+        stationary point. Initializing the shared head from warm-up features
+        gives its first active epoch a useful partition without using labels.
+        For normalized representations, centers approximate cosine prototypes.
+        """
+
+        if not representations:
+            raise ValueError("at least one representation is required")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        embedding = torch.stack(list(representations), dim=0).mean(dim=0)
+        if embedding.ndim != 2 or embedding.shape[1] != self.projection.in_features:
+            raise ValueError("representations do not match ClusterHead input dimension")
+
+        from sklearn.cluster import KMeans
+
+        kmeans = KMeans(
+            n_clusters=self.projection.out_features,
+            n_init=20,
+            random_state=seed,
+        )
+        kmeans.fit(embedding.detach().cpu().numpy())
+        centers = torch.as_tensor(
+            kmeans.cluster_centers_,
+            dtype=self.projection.weight.dtype,
+            device=self.projection.weight.device,
+        )
+        self.projection.weight.copy_(centers / temperature)
+        self.projection.bias.copy_(-centers.pow(2).sum(dim=1) / (2.0 * temperature))
 
 
 def target_distribution(q: Tensor, eps: float = 1e-12) -> Tensor:

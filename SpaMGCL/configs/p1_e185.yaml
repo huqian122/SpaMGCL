@@ -1,7 +1,7 @@
 experiment:
-  name: p1_hlna1
+  name: p1_e185
   phase: P1
-  dataset: HLN-A1
+  dataset: E18.5
   seed: 0
   epochs: 50
   warm_up_epochs: 10
@@ -9,7 +9,7 @@ experiment:
 data:
   # Change only this config value when running in Colab.
   root: /Users/qianhu/博士论文/多角度聚类医学论文/SpaMGCL/Expert Systems SMGC/SMGC-data
-  label_key: Spatial_Label
+  label_key: Combined_Clusters
   spatial_key: spatial
   spatial_row_key: array_row
   spatial_col_key: array_col
@@ -36,7 +36,7 @@ model:
   coarse_dim: 16
   representation_dim: 16
   fusion_hidden_dim: 64
-  num_clusters: 10
+  num_clusters: 14
   alpha: 0.5
   tau_s: 0.3
   cluster_temperature: 1.0
@@ -61,7 +61,7 @@ loss:
 clustering:
   method: argmax
   embedding: cluster_probabilities
-  n_clusters: 10
+  n_clusters: 14
 
 output:
-  root: results/p1_hlna1
+  root: results/p1_e185
