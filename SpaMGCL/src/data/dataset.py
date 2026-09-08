@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Tuple
 
 import numpy as np
+from sklearn.decomposition import PCA
 
 from src.graphs.spatial_graph import extract_spatial_coordinates
 
@@ -120,6 +121,43 @@ def _get_matrix(adata: Any, matrix_source: str) -> Any:
     raise ValueError("matrix_source must be 'X' or 'layers:<key>'")
 
 
+def _pca_features(
+    matrix: np.ndarray,
+    modality: str,
+    n_pca_components: Optional[int],
+) -> np.ndarray:
+    """Apply deterministic, modality-specific PCA whitening when configured.
+
+    Whitening keeps the retained components on a comparable unit-variance
+    scale. This matters for datasets whose modalities are stored in very
+    different units, such as HLN-A1 RNA and ADT. Lower-dimensional inputs
+    retain their feature count but are also whitened when this option is
+    enabled, so raw-count ADT cannot dominate RNA.
+    """
+
+    if n_pca_components is None:
+        return matrix
+    if n_pca_components < 1:
+        raise ValueError("n_pca_components must be positive or None")
+
+    n_components = min(n_pca_components, matrix.shape[1], matrix.shape[0])
+    if n_components < 1:
+        raise ValueError(f"{modality} has no features or observations")
+
+    # For lower-dimensional modalities, retain all features but still whiten
+    # them so one raw-count modality cannot dominate the reconstruction loss.
+    reducer = PCA(
+        n_components=n_components,
+        whiten=True,
+        svd_solver="randomized" if n_components < min(matrix.shape) else "auto",
+        random_state=0,
+    )
+    reduced = np.asarray(reducer.fit_transform(matrix), dtype=np.float32)
+    if not np.isfinite(reduced).all():
+        raise ValueError(f"PCA produced NaN or Inf for modality {modality}")
+    return reduced
+
+
 def _select_label_key(adata: Any, requested: Optional[str], default: str) -> str:
     if requested in {None, "", "UNRESOLVED"}:
         requested = default
@@ -140,8 +178,9 @@ def load_spatial_multiomics(
     spatial_row_key: str = "array_row",
     spatial_col_key: str = "array_col",
     matrix_source: str = "X",
+    n_pca_components: Optional[int] = None,
 ) -> SpatialMultiOmicsSample:
-    """Load one paired dataset and enforce spot-order alignment."""
+    """Load one paired dataset, optionally PCA-whiten each modality."""
 
     try:
         import anndata
@@ -164,10 +203,11 @@ def load_spatial_multiomics(
                     f"spot order mismatch between {modality_names[0]} and {modality}"
                 )
 
-        features = {
-            modality: _matrix_to_numpy(_get_matrix(adata, matrix_source))
-            for modality, adata in adatas.items()
-        }
+        features = {}
+        for modality, adata in adatas.items():
+            matrix = _matrix_to_numpy(_get_matrix(adata, matrix_source))
+            reduced = _pca_features(matrix, modality, n_pca_components)
+            features[modality] = reduced
         coordinates = extract_spatial_coordinates(
             reference,
             spatial_key=spatial_key,

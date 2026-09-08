@@ -216,6 +216,9 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
     spatial_row_key = str(data_config.get("spatial_row_key", "array_row"))
     spatial_col_key = str(data_config.get("spatial_col_key", "array_col"))
     matrix_source = str(data_config.get("matrix_source", "X"))
+    n_pca_components = data_config.get("n_pca_components")
+    if n_pca_components is not None:
+        n_pca_components = int(n_pca_components)
 
     _seed_everything(seed)
     device = _device_from_config(config)
@@ -227,6 +230,7 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         spatial_row_key=spatial_row_key,
         spatial_col_key=spatial_col_key,
         matrix_source=matrix_source,
+        n_pca_components=n_pca_components,
     )
     features = {
         modality: prepare_features(

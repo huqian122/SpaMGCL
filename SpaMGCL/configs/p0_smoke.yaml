@@ -14,6 +14,9 @@ data:
   spatial_row_key: array_row
   spatial_col_key: array_col
   matrix_source: X
+  # Keep the established Simulation P0 feature representation unchanged.
+  # Set this to 100 in a P1 config for raw high-dimensional datasets.
+  n_pca_components: null
 
 preprocessing:
   # Phase 1 established that the supplied X scale is not to be assumed to be counts.
