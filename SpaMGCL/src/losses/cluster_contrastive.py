@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Dict, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -29,15 +29,18 @@ def target_distribution(q: Tensor, eps: float = 1e-12) -> Tensor:
 
     if q.ndim != 2:
         raise ValueError("q must be a 2D probability matrix")
+    if torch.any(q < 0):
+        raise ValueError("q must contain nonnegative probabilities")
     weight = q.pow(2) / q.sum(dim=0, keepdim=True).clamp_min(eps)
     return weight / weight.sum(dim=1, keepdim=True).clamp_min(eps)
 
 
 class ClusterContrastiveLoss(nn.Module):
-    """Contrast corresponding cluster distributions across view pairs.
+    """MGCMVC cluster-level NT-Xent over corresponding view clusters.
 
-    The regularizer follows the reference implementation's batch cluster
-    entropy term: ``log(C) + sum_c p_c log(p_c)`` for each view.
+    For each pair of views, the C cluster columns from both target matrices
+    form 2C samples. A cluster is positive only with its same-index cluster
+    in the other view; all remaining clusters are negatives.
     """
 
     def __init__(self, temperature: float = 1.0, eps: float = 1e-12) -> None:
@@ -52,18 +55,45 @@ class ClusterContrastiveLoss(nn.Module):
             raise ValueError("q_left and q_right must have equal 2D shapes")
         p_left = target_distribution(q_left, self.eps)
         p_right = target_distribution(q_right, self.eps)
-        # Cluster vectors are columns of P, matching the source implementation.
-        left = F.normalize(p_left.T, dim=1)
-        right = F.normalize(p_right.T, dim=1)
-        logits = left @ right.T / self.temperature
-        labels = torch.arange(logits.shape[0], device=logits.device)
-        return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+        # Cluster vectors are columns of P, matching MGCMVC's implementation.
+        clusters = F.normalize(torch.cat((p_left.T, p_right.T), dim=0), dim=1)
+        similarity = clusters @ clusters.T / self.temperature
+        count = similarity.shape[0]
+        num_clusters = q_left.shape[1]
+        positive_index = (torch.arange(count, device=similarity.device) + num_clusters) % count
+        self_mask = torch.eye(count, device=similarity.device, dtype=torch.bool)
+        positive_mask = F.one_hot(positive_index, num_classes=count).to(torch.bool)
+        negative_mask = ~(self_mask | positive_mask)
+        positive_logits = similarity.gather(1, positive_index.unsqueeze(1))
+        negative_logits = similarity.masked_fill(~negative_mask, float("-inf"))
+        logits = torch.cat((positive_logits, negative_logits), dim=1)
+        labels = torch.zeros(count, device=similarity.device, dtype=torch.long)
+        return F.cross_entropy(logits, labels)
 
     def entropy_regularizer(self, q: Tensor) -> Tensor:
-        cluster_mass = q.mean(dim=0)
+        cluster_mass = target_distribution(q, self.eps).mean(dim=0)
         return torch.log(torch.tensor(q.shape[1], device=q.device, dtype=q.dtype)) + (
             cluster_mass * torch.log(cluster_mass.clamp_min(self.eps))
         ).sum()
+
+    def diagnostics(self, assignments: Sequence[Tensor]) -> Dict[str, Tensor]:
+        """Return non-gradient collapse indicators for experiment logging."""
+
+        with torch.no_grad():
+            q = torch.stack([assignment.detach() for assignment in assignments]).mean(dim=0)
+            mass = q.mean(dim=0)
+            sample_entropy = -(q * torch.log(q.clamp_min(self.eps))).sum(dim=1).mean()
+            max_probability = q.max(dim=1).values.mean()
+            effective_clusters = torch.exp(
+                -(mass * torch.log(mass.clamp_min(self.eps))).sum()
+            )
+            return {
+                "assignment_entropy": sample_entropy,
+                "max_probability": max_probability,
+                "effective_clusters": effective_clusters,
+                "min_cluster_mass": mass.min(),
+                "max_cluster_mass": mass.max(),
+            }
 
     def forward(
         self,

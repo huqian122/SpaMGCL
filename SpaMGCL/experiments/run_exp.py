@@ -120,6 +120,16 @@ def _json_float(value: torch.Tensor) -> float:
     return result
 
 
+def _gradient_norm(module: torch.nn.Module) -> float:
+    """Return the post-backward L2 norm for a module's trainable gradients."""
+
+    squared_norm = 0.0
+    for parameter in module.parameters():
+        if parameter.grad is not None:
+            squared_norm += float(parameter.grad.detach().pow(2).sum().cpu())
+    return float(np.sqrt(squared_norm))
+
+
 def _build_model_config(config: Mapping[str, Any], num_clusters: int) -> Dict[str, Any]:
     model = dict(_section(config, "model"))
     model.setdefault("gcn_hidden_dim", 64)
@@ -131,7 +141,13 @@ def _build_model_config(config: Mapping[str, Any], num_clusters: int) -> Dict[st
     model.setdefault("temperature", 0.5)
     model.setdefault("cluster_temperature", 1.0)
     model.setdefault("cluster_regularization_weight", 1.0)
-    model["num_clusters"] = int(model.get("num_clusters", num_clusters))
+    configured_model_clusters = model.get("num_clusters")
+    if configured_model_clusters is not None and int(configured_model_clusters) != num_clusters:
+        raise ValueError(
+            "model.num_clusters and clustering.n_clusters must match: "
+            f"{configured_model_clusters} != {num_clusters}"
+        )
+    model["num_clusters"] = num_clusters
     return model
 
 
@@ -261,12 +277,21 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         raise ValueError("ARI/NMI evaluation requires a configured label field")
 
     default_cluster_count = int(np.unique(labels).size)
-    num_clusters = int(
-        clustering_config.get(
-            "n_clusters",
-            _section(config, "model").get("num_clusters", default_cluster_count),
+    model_cluster_count = _section(config, "model").get("num_clusters")
+    clustering_cluster_count = clustering_config.get("n_clusters")
+    configured_cluster_counts = [
+        int(value)
+        for value in (model_cluster_count, clustering_cluster_count)
+        if value is not None
+    ]
+    if len(set(configured_cluster_counts)) > 1:
+        raise ValueError(
+            "model.num_clusters and clustering.n_clusters must match; "
+            f"received {configured_cluster_counts}"
         )
-    )
+    num_clusters = configured_cluster_counts[0] if configured_cluster_counts else default_cluster_count
+    if num_clusters < 2:
+        raise ValueError("num_clusters must be at least 2")
     model_config = _build_model_config(config, num_clusters)
     model = SpaMGCL(
         input_dims={modality: int(matrix.shape[1]) for modality, matrix in features.items()},
@@ -309,7 +334,12 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             raise FloatingPointError(f"non-finite total loss at epoch {epoch_number}")
         optimizer.zero_grad(set_to_none=True)
         total_loss.backward()
+        cluster_head_gradient_norm = _gradient_norm(model.cluster_head)
         optimizer.step()
+
+        cluster_diagnostics = model.cluster_contrastive_loss.diagnostics(
+            output.cluster_assignments
+        )
 
         record = {
             "epoch": epoch_number,
@@ -323,6 +353,18 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             "lambda_cluster": lambda_cluster,
             "lambda_spatial": lambda_spatial,
             "cluster_enabled": cluster_enabled,
+            "cluster_assignment_entropy": _json_float(
+                cluster_diagnostics["assignment_entropy"]
+            ),
+            "cluster_max_probability": _json_float(
+                cluster_diagnostics["max_probability"]
+            ),
+            "cluster_effective_clusters": _json_float(
+                cluster_diagnostics["effective_clusters"]
+            ),
+            "cluster_min_mass": _json_float(cluster_diagnostics["min_cluster_mass"]),
+            "cluster_max_mass": _json_float(cluster_diagnostics["max_cluster_mass"]),
+            "cluster_head_gradient_norm": cluster_head_gradient_norm,
         }
         history.append(record)
         print(
@@ -330,7 +372,9 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             f"total={record['total']:.6f} | rec={record['reconstruction']:.6f} | "
             f"mgcl={record['sample_contrastive']:.6f} | "
             f"cluster={record['cluster_contrastive']:.6f} | "
-            f"spatial={record['spatial']:.6f}"
+            f"spatial={record['spatial']:.6f} | "
+            f"effC={record['cluster_effective_clusters']:.3f} | "
+            f"gradC={record['cluster_head_gradient_norm']:.3e}"
         )
 
     model.eval()
@@ -352,12 +396,18 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         embedding, num_clusters, method=method, seed=seed
     )
     metrics = clustering_metrics(labels, predicted)
+    final_cluster_diagnostics = model.cluster_contrastive_loss.diagnostics(
+        final_output.cluster_assignments
+    )
 
     output_section = _section(config, "output")
     output_value = output_section.get(
-        "dir", config.get("output_dir", config.get("output", "results/p0_smoke"))
+        "root",
+        output_section.get(
+            "dir", config.get("output_dir", config.get("output", "results/p0_smoke"))
+        ),
     )
-    output_dir = _resolve_path(output_value, base=PROJECT_ROOT, field_name="output.dir")
+    output_dir = _resolve_path(output_value, base=PROJECT_ROOT, field_name="output.root")
     output_dir.mkdir(parents=True, exist_ok=True)
     output_config_path = output_dir / "config.yaml"
     if config_path.resolve() != output_config_path.resolve():
@@ -379,6 +429,9 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         "NMI": metrics["NMI"],
         "metrics": metrics,
         "final_weights": [float(value) for value in final_output.weights.detach().cpu()],
+        "final_cluster_diagnostics": {
+            key: _json_float(value) for key, value in final_cluster_diagnostics.items()
+        },
         "data": sample_summary(sample),
         "graph_stats": {
             "spatial": {"shape": list(spatial_adjacency.shape), "nnz": int(spatial_adjacency.nnz)},

@@ -29,6 +29,7 @@ class SpaMGCLForwardOutput:
     spatial_consistency_scores: Tensor
     combined_distances: Tensor
     weights: Tensor
+    cluster_assignments: Sequence[Tensor]
     gcn_views: Dict[str, Tensor]
     multigranularity_views: Dict[str, Dict[str, Tensor]]
 
@@ -80,12 +81,9 @@ class SpaMGCL(nn.Module):
             fusion_hidden_dim=fusion_hidden_dim,
             alpha=alpha,
         )
-        self.cluster_heads = nn.ModuleDict(
-            {
-                view_name: ClusterHead(representation_dim, num_clusters)
-                for view_name in self.view_order
-            }
-        )
+        # MGCMVC uses one label projection shared by all views. Sharing the
+        # head makes cluster index c mean the same thing in every Q_v.
+        self.cluster_head = ClusterHead(representation_dim, num_clusters)
         self.reconstruction_loss = ReconstructionLoss()
         self.sample_contrastive_loss = AdaptiveSampleContrastiveLoss(temperature=temperature)
         self.cluster_contrastive_loss = ClusterContrastiveLoss(temperature=cluster_temperature)
@@ -147,7 +145,7 @@ class SpaMGCL(nn.Module):
             spatial_adjacency=spatial_adjacency,
         )
         assignments = [
-            self.cluster_heads[view_name](multigranularity_views[view_name]["g"])
+            self.cluster_head(multigranularity_views[view_name]["g"])
             for view_name in self.view_order
         ]
         cluster_contrastive = self.cluster_contrastive_loss(
@@ -168,6 +166,7 @@ class SpaMGCL(nn.Module):
             spatial_consistency_scores=spatial_consistency_scores,
             combined_distances=combined_distances,
             weights=weights,
+            cluster_assignments=assignments,
             gcn_views=gcn_views,
             multigranularity_views=multigranularity_views,
         )
