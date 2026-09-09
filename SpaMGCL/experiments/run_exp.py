@@ -147,9 +147,19 @@ def _embedding_from_output(output: Any, mode: str) -> torch.Tensor:
             [output.multigranularity_views[name]["g"] for name in output.multigranularity_views],
             dim=1,
         )
+    if mode == "mean_z":
+        return torch.stack(
+            [output.multigranularity_views[name]["z"] for name in output.multigranularity_views],
+            dim=0,
+        ).mean(dim=0)
+    if mode == "concat_z":
+        return torch.cat(
+            [output.multigranularity_views[name]["z"] for name in output.multigranularity_views],
+            dim=1,
+        )
     raise ValueError(
         "clustering.embedding must be one of: global, weighted_views, "
-        "mean_views, cluster_probabilities, concat_views"
+        "mean_views, cluster_probabilities, concat_views, mean_z, concat_z"
     )
 
 
@@ -579,6 +589,33 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         "method": q_method,
         **clustering_metrics(labels, q_predicted),
     }
+    z_view_metrics: Dict[str, Any] = {}
+    for view_name in model.view_order:
+        z_embedding = (
+            final_output.multigranularity_views[view_name]["z"]
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        z_predicted, z_method = _cluster_embedding(
+            z_embedding, num_clusters, method="kmeans", seed=seed
+        )
+        z_view_metrics[view_name] = {
+            "method": z_method,
+            "dim": int(z_embedding.shape[1]),
+            **clustering_metrics(labels, z_predicted),
+        }
+    representation_metrics: Dict[str, Any] = {"z_views": z_view_metrics}
+    for z_mode in ("mean_z", "concat_z"):
+        z_embedding = _embedding_from_output(final_output, z_mode).detach().cpu().numpy()
+        z_predicted, z_method = _cluster_embedding(
+            z_embedding, num_clusters, method="kmeans", seed=seed
+        )
+        representation_metrics[z_mode] = {
+            "method": z_method,
+            "dim": int(z_embedding.shape[1]),
+            **clustering_metrics(labels, z_predicted),
+        }
     final_cluster_diagnostics = model.cluster_contrastive_loss.diagnostics(
         final_output.cluster_assignments
     )
@@ -616,6 +653,8 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         "clustering_method_used": method_used,
         "clustering_embedding": embedding_mode,
         "candidate_metrics": candidate_metrics,
+        "representation_metrics": representation_metrics,
+        "fine_dim": int(model_config["fine_dim"]),
         "num_clusters": num_clusters,
         "ARI": metrics["ARI"],
         "NMI": metrics["NMI"],
