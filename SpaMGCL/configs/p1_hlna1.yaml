@@ -52,6 +52,12 @@ training:
   cluster_head_init: none
   spatial_start_epoch: 51
 
+spatial:
+  # Pure MGCMVC-core baseline: retain spatial GCN views, disable SpaMGCL additions.
+  enabled: false
+  consistency_weighting: false
+  negative_filter: false
+
 loss:
   lambda_rec: 1.0
   lambda_mgcl: 1.0

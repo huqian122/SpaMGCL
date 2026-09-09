@@ -105,6 +105,9 @@ class SpaMGCL(nn.Module):
         alpha: Optional[float] = None,
         modality_a_name: Optional[str] = None,
         modality_b_name: Optional[str] = None,
+        use_spatial_weighting: bool = True,
+        use_spatial_negative_filter: bool = True,
+        use_spatial_loss: bool = True,
     ) -> SpaMGCLForwardOutput:
         modality_a_name = modality_a_name or self.modality_names[0]
         modality_b_name = modality_b_name or self.modality_names[1]
@@ -126,17 +129,25 @@ class SpaMGCL(nn.Module):
         representations = [multigranularity_views[view_name]["g"] for view_name in self.view_order]
         reconstructions = [multigranularity_views[view_name]["reconstruction"] for view_name in self.view_order]
 
-        (
-            global_representation,
-            wd_distances,
-            spatial_consistency_scores,
-            combined_distances,
-            weights,
-        ) = self.weight_module(
-            representations,
-            spatial_adjacency=spatial_adjacency,
-            alpha=alpha,
-        )
+        if use_spatial_weighting:
+            (
+                global_representation,
+                wd_distances,
+                spatial_consistency_scores,
+                combined_distances,
+                weights,
+            ) = self.weight_module(
+                representations,
+                spatial_adjacency=spatial_adjacency,
+                alpha=alpha,
+            )
+        else:
+            global_representation, wd_distances, weights = self.weight_module(
+                representations,
+                spatial_adjacency=None,
+            )
+            spatial_consistency_scores = torch.zeros_like(wd_distances)
+            combined_distances = wd_distances
 
         reconstruction = self.reconstruction_loss(
             [gcn_views[view_name] for view_name in self.view_order],
@@ -145,7 +156,9 @@ class SpaMGCL(nn.Module):
         sample_contrastive = self.sample_contrastive_loss(
             representations,
             weights,
-            spatial_adjacency=spatial_adjacency,
+            spatial_adjacency=(
+                spatial_adjacency if use_spatial_negative_filter else None
+            ),
         )
         assignments = [
             self.cluster_head(multigranularity_views[view_name]["z"])
@@ -155,7 +168,12 @@ class SpaMGCL(nn.Module):
             assignments,
             regularization_weight=self.cluster_regularization_weight,
         )
-        spatial_loss = self.spatial_regularization_loss(representations, spatial_adjacency)
+        if use_spatial_loss:
+            spatial_loss = self.spatial_regularization_loss(
+                representations, spatial_adjacency
+            )
+        else:
+            spatial_loss = representations[0].new_zeros(())
         stacked_representations = torch.stack(representations, dim=0)
         weighted_representation = torch.sum(
             weights[:, None, None] * stacked_representations, dim=0

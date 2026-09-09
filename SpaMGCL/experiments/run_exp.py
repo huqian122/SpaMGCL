@@ -231,6 +231,7 @@ def _effective_loss_coefficients(
     epoch_number: int,
     warm_up_epochs: int,
     spatial_start_epoch: Optional[int] = None,
+    spatial_mechanism_enabled: bool = True,
 ) -> Tuple[float, float, float, float, bool, bool]:
     loss = _section(config, "loss")
     lambda_rec = float(loss.get("lambda_rec", config.get("lambda_rec", 1.0)))
@@ -253,7 +254,9 @@ def _effective_loss_coefficients(
         raise ValueError("spatial_start_epoch must be positive")
 
     cluster_enabled = epoch_number > warm_up_epochs
-    spatial_enabled = epoch_number >= spatial_start_epoch
+    spatial_enabled = (
+        spatial_mechanism_enabled and epoch_number >= spatial_start_epoch
+    )
     return (
         lambda_rec,
         lambda_mgcl,
@@ -293,6 +296,14 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
     )
     if spatial_start_epoch < 1:
         raise ValueError("spatial_start_epoch must be positive")
+    spatial_config = _section(config, "spatial")
+    spatial_mechanism_enabled = bool(spatial_config.get("enabled", True))
+    spatial_weighting_enabled = spatial_mechanism_enabled and bool(
+        spatial_config.get("consistency_weighting", True)
+    )
+    spatial_negative_filter_enabled = spatial_mechanism_enabled and bool(
+        spatial_config.get("negative_filter", True)
+    )
 
     data_root = _resolve_path(data_config.get("root"), base=PROJECT_ROOT, field_name="data.root")
     label_key = data_config.get("label_key")
@@ -405,6 +416,21 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
     for epoch_index in range(epochs):
         epoch_number = epoch_index + 1
         model.train()
+        coefficients = _effective_loss_coefficients(
+            config,
+            epoch_number,
+            warm_up_epochs,
+            spatial_start_epoch=spatial_start_epoch,
+            spatial_mechanism_enabled=spatial_mechanism_enabled,
+        )
+        (
+            lambda_rec,
+            lambda_mgcl,
+            lambda_cluster,
+            lambda_spatial,
+            cluster_enabled,
+            spatial_enabled,
+        ) = coefficients
         output = model(
             inputs[first_modality],
             spatial_tensor,
@@ -415,18 +441,10 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             spatial_tensor,
             modality_a_name=first_modality,
             modality_b_name=second_modality,
+            use_spatial_weighting=spatial_weighting_enabled,
+            use_spatial_negative_filter=spatial_negative_filter_enabled,
+            use_spatial_loss=spatial_enabled,
         )
-        coefficients = _effective_loss_coefficients(
-            config, epoch_number, warm_up_epochs
-        )
-        (
-            lambda_rec,
-            lambda_mgcl,
-            lambda_cluster,
-            lambda_spatial,
-            cluster_enabled,
-            spatial_enabled,
-        ) = coefficients
         total_loss = (
             lambda_rec * output.reconstruction_loss
             + lambda_mgcl * output.sample_contrastive_loss
@@ -472,6 +490,8 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             "lambda_spatial": lambda_spatial,
             "cluster_enabled": cluster_enabled,
             "spatial_enabled": spatial_enabled,
+            "spatial_weighting_enabled": spatial_weighting_enabled,
+            "spatial_negative_filter_enabled": spatial_negative_filter_enabled,
             "cluster_assignment_entropy": _json_float(
                 cluster_diagnostics["assignment_entropy"]
             ),
@@ -492,6 +512,8 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             f"mgcl={record['sample_contrastive']:.6f} | "
             f"cluster={record['cluster_contrastive']:.6f} | "
             f"spatial={record['spatial']:.6f} | "
+            f"SC={'on' if record['spatial_weighting_enabled'] else 'off'} | "
+            f"SNF={'on' if record['spatial_negative_filter_enabled'] else 'off'} | "
             f"effC={record['cluster_effective_clusters']:.3f} | "
             f"gradC={record['cluster_head_gradient_norm']:.3e}"
         )
@@ -508,6 +530,9 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             spatial_tensor,
             modality_a_name=first_modality,
             modality_b_name=second_modality,
+            use_spatial_weighting=spatial_weighting_enabled,
+            use_spatial_negative_filter=spatial_negative_filter_enabled,
+            use_spatial_loss=spatial_enabled,
         )
     clustering_options = dict(clustering_config)
     method = str(clustering_config.get("method", "kmeans"))
@@ -578,6 +603,9 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         "epochs": epochs,
         "warm_up_epochs": warm_up_epochs,
         "spatial_start_epoch": spatial_start_epoch,
+        "spatial_mechanism_enabled": spatial_mechanism_enabled,
+        "spatial_weighting_enabled": spatial_weighting_enabled,
+        "spatial_negative_filter_enabled": spatial_negative_filter_enabled,
         "cluster_enabled_epochs": [
             record["epoch"] for record in history if record["cluster_enabled"]
         ],
