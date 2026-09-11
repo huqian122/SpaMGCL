@@ -1,0 +1,218 @@
+{
+  "dataset": "Simulation",
+  "seed": 0,
+  "device": "cpu",
+  "epochs": 5,
+  "warm_up_epochs": 10,
+  "spatial_start_epoch": 11,
+  "cluster_enabled_epochs": [],
+  "spatial_enabled_epochs": [],
+  "clustering_method_requested": "kmeans",
+  "clustering_method_used": "kmeans",
+  "clustering_embedding": "global",
+  "candidate_metrics": {
+    "global": {
+      "method": "kmeans",
+      "ARI": 0.7005640386916535,
+      "NMI": 0.7421816015328216
+    },
+    "weighted_views": {
+      "method": "kmeans",
+      "ARI": 0.9896464636359961,
+      "NMI": 0.9864331488496643
+    },
+    "mean_views": {
+      "method": "kmeans",
+      "ARI": 0.9896464636359961,
+      "NMI": 0.9864331488496643
+    },
+    "cluster_probabilities": {
+      "method": "kmeans",
+      "ARI": 0.6189948141854797,
+      "NMI": 0.7223910897894777
+    },
+    "concat_views": {
+      "method": "kmeans",
+      "ARI": 0.9958438226019004,
+      "NMI": 0.9936498979553107
+    },
+    "cluster_argmax": {
+      "method": "argmax",
+      "ARI": 0.0028084144886713898,
+      "NMI": 0.010508793054372727
+    }
+  },
+  "num_clusters": 5,
+  "ARI": 0.7005640386916535,
+  "NMI": 0.7421816015328216,
+  "metrics": {
+    "ARI": 0.7005640386916535,
+    "NMI": 0.7421816015328216
+  },
+  "final_weights": [
+    0.24858465790748596,
+    0.24797289073467255,
+    0.2493392825126648,
+    0.2541031837463379
+  ],
+  "final_cluster_diagnostics": {
+    "assignment_entropy": 1.6079998016357422,
+    "max_probability": 0.21098379790782928,
+    "effective_clusters": 4.992956161499023,
+    "min_cluster_mass": 0.18082237243652344,
+    "max_cluster_mass": 0.21096642315387726
+  },
+  "data": {
+    "dataset": "Simulation",
+    "n_spots": 1296,
+    "modalities": {
+      "RNA": {
+        "shape": [
+          1296,
+          800
+        ],
+        "dtype": "float32"
+      },
+      "ADT": {
+        "shape": [
+          1296,
+          200
+        ],
+        "dtype": "float32"
+      }
+    },
+    "spatial_source": "obsm['spatial']",
+    "label_key": "ground_truth",
+    "modality_paths": {
+      "RNA": "/Users/qianhu/博士论文/多角度聚类医学论文/SpaMGCL/Expert Systems SMGC/SMGC-data/simulation/adata_RNA.h5ad",
+      "ADT": "/Users/qianhu/博士论文/多角度聚类医学论文/SpaMGCL/Expert Systems SMGC/SMGC-data/simulation/adata_ADT.h5ad"
+    }
+  },
+  "graph_stats": {
+    "spatial": {
+      "shape": [
+        1296,
+        1296
+      ],
+      "nnz": 4488
+    },
+    "feature": {
+      "RNA": {
+        "shape": [
+          1296,
+          1296
+        ],
+        "nnz": 38238
+      },
+      "ADT": {
+        "shape": [
+          1296,
+          1296
+        ],
+        "nnz": 40816
+      }
+    }
+  },
+  "loss_history": [
+    {
+      "epoch": 1,
+      "total": 7.957476615905762,
+      "reconstruction": 0.7920315265655518,
+      "sample_contrastive": 7.165445327758789,
+      "cluster_contrastive": 2.2025976181030273,
+      "spatial": 0.009878904558718204,
+      "lambda_rec": 1.0,
+      "lambda_mgcl": 1.0,
+      "lambda_cluster": 0.0,
+      "lambda_spatial": 0.0,
+      "cluster_enabled": false,
+      "spatial_enabled": false,
+      "cluster_assignment_entropy": 1.6047868728637695,
+      "cluster_max_probability": 0.2267923504114151,
+      "cluster_effective_clusters": 4.977571487426758,
+      "cluster_min_mass": 0.17003656923770905,
+      "cluster_max_mass": 0.2267923653125763,
+      "cluster_head_gradient_norm": 0.0
+    },
+    {
+      "epoch": 2,
+      "total": 7.680428504943848,
+      "reconstruction": 0.5157004594802856,
+      "sample_contrastive": 7.164728164672852,
+      "cluster_contrastive": 2.2016775608062744,
+      "spatial": 0.00538024352863431,
+      "lambda_rec": 1.0,
+      "lambda_mgcl": 1.0,
+      "lambda_cluster": 0.0,
+      "lambda_spatial": 0.0,
+      "cluster_enabled": false,
+      "spatial_enabled": false,
+      "cluster_assignment_entropy": 1.6056631803512573,
+      "cluster_max_probability": 0.22218716144561768,
+      "cluster_effective_clusters": 4.981663703918457,
+      "cluster_min_mass": 0.17147400975227356,
+      "cluster_max_mass": 0.22218716144561768,
+      "cluster_head_gradient_norm": 0.0
+    },
+    {
+      "epoch": 3,
+      "total": 7.52463960647583,
+      "reconstruction": 0.3602028489112854,
+      "sample_contrastive": 7.1644368171691895,
+      "cluster_contrastive": 2.200932264328003,
+      "spatial": 0.003409501863643527,
+      "lambda_rec": 1.0,
+      "lambda_mgcl": 1.0,
+      "lambda_cluster": 0.0,
+      "lambda_spatial": 0.0,
+      "cluster_enabled": false,
+      "spatial_enabled": false,
+      "cluster_assignment_entropy": 1.6063804626464844,
+      "cluster_max_probability": 0.2189631462097168,
+      "cluster_effective_clusters": 4.985083103179932,
+      "cluster_min_mass": 0.1735934466123581,
+      "cluster_max_mass": 0.2189631462097168,
+      "cluster_head_gradient_norm": 0.0
+    },
+    {
+      "epoch": 4,
+      "total": 7.428508281707764,
+      "reconstruction": 0.2641659379005432,
+      "sample_contrastive": 7.164342403411865,
+      "cluster_contrastive": 2.2002124786376953,
+      "spatial": 0.0024444719310849905,
+      "lambda_rec": 1.0,
+      "lambda_mgcl": 1.0,
+      "lambda_cluster": 0.0,
+      "lambda_spatial": 0.0,
+      "cluster_enabled": false,
+      "spatial_enabled": false,
+      "cluster_assignment_entropy": 1.60702645778656,
+      "cluster_max_probability": 0.21603864431381226,
+      "cluster_effective_clusters": 4.988212585449219,
+      "cluster_min_mass": 0.17610672116279602,
+      "cluster_max_mass": 0.21603535115718842,
+      "cluster_head_gradient_norm": 0.0
+    },
+    {
+      "epoch": 5,
+      "total": 7.364222049713135,
+      "reconstruction": 0.1999034434556961,
+      "sample_contrastive": 7.164318561553955,
+      "cluster_contrastive": 2.199582099914551,
+      "spatial": 0.001933704479597509,
+      "lambda_rec": 1.0,
+      "lambda_mgcl": 1.0,
+      "lambda_cluster": 0.0,
+      "lambda_spatial": 0.0,
+      "cluster_enabled": false,
+      "spatial_enabled": false,
+      "cluster_assignment_entropy": 1.6075737476348877,
+      "cluster_max_probability": 0.2133994698524475,
+      "cluster_effective_clusters": 4.990884304046631,
+      "cluster_min_mass": 0.17860589921474457,
+      "cluster_max_mass": 0.21339435875415802,
+      "cluster_head_gradient_norm": 0.0
+    }
+  ]
+}

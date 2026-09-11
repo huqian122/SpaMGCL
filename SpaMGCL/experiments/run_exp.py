@@ -70,6 +70,54 @@ def _section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return value
 
 
+def _prepare_output_dir(
+    config: Mapping[str, Any], config_path: Path
+) -> Tuple[Path, Path]:
+    """Resolve and reserve the immutable output location for one run.
+
+    ``output.root`` is the current format. ``output.dir`` is retained for
+    compatibility, but its final path is treated as a legacy hint and its
+    parent becomes the root for the new ``root / experiment.name`` layout.
+    """
+
+    output = _section(config, "output")
+    if "root" in output and output.get("root") is not None:
+        root_value = output.get("root")
+        root_field = "output.root"
+    elif "dir" in output and output.get("dir") is not None:
+        legacy_value = output.get("dir")
+        if not isinstance(legacy_value, str) or not legacy_value.strip():
+            raise ValueError("Config must define a non-empty string at output.dir")
+        root_value = str(Path(legacy_value).expanduser().parent)
+        root_field = "output.dir parent"
+    else:
+        raise ValueError(
+            "Config must define output.root or output.dir; "
+            "the output location is required"
+        )
+
+    root = _resolve_path(root_value, base=PROJECT_ROOT, field_name=root_field)
+    experiment = _section(config, "experiment")
+    experiment_name = experiment.get("name")
+    if not isinstance(experiment_name, str) or not experiment_name.strip():
+        raise ValueError("Config must define a non-empty string at experiment.name")
+    output_dir = (root / experiment_name.strip()).resolve()
+    if output_dir == root:
+        raise ValueError("experiment.name must identify a child output directory")
+    metrics_path = output_dir / "metrics.json"
+    if metrics_path.is_file():
+        raise FileExistsError(
+            f"Output directory already contains metrics.json: {output_dir}. "
+            "Choose a different experiment.name or output root."
+        )
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    snapshot_path = output_dir / "config.yaml"
+    if config_path.resolve() != snapshot_path.resolve():
+        shutil.copy2(config_path, snapshot_path)
+    return root, output_dir
+
+
 def _seed_everything(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -279,6 +327,7 @@ def _effective_loss_coefficients(
 
 def run_experiment(config_path: Path) -> Dict[str, Any]:
     config = _load_config(config_path)
+    _, output_dir = _prepare_output_dir(config, config_path)
     experiment = _section(config, "experiment")
     data_config = _section(config, "data")
     training_config = _section(config, "training")
@@ -620,23 +669,13 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         final_output.cluster_assignments
     )
 
-    output_section = _section(config, "output")
-    output_value = output_section.get(
-        "root",
-        output_section.get(
-            "dir", config.get("output_dir", config.get("output", "results/p0_smoke"))
-        ),
-    )
-    output_dir = _resolve_path(output_value, base=PROJECT_ROOT, field_name="output.root")
-    output_dir.mkdir(parents=True, exist_ok=True)
     output_config_path = output_dir / "config.yaml"
-    if config_path.resolve() != output_config_path.resolve():
-        shutil.copy2(config_path, output_config_path)
 
     report: Dict[str, Any] = {
         "dataset": dataset,
         "seed": seed,
         "device": str(device),
+        "output_dir": str(output_dir),
         "epochs": epochs,
         "warm_up_epochs": warm_up_epochs,
         "spatial_start_epoch": spatial_start_epoch,
@@ -678,6 +717,7 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     print(f"ARI={report['ARI']:.6f} | NMI={report['NMI']:.6f}")
+    print(f"Output directory: {output_dir}")
     print(f"Saved metrics: {metrics_path}")
     print(f"Saved config copy: {output_config_path}")
     return report
