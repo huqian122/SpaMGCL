@@ -9,7 +9,7 @@ experiment:
 data:
   # Change only this config value when running in Colab.
   root: /kaggle/input/datasets/wuvdji/smgc-data/
-  label_key: Combined_Clusters
+  label_key: Spatial_Label
   spatial_key: spatial
   spatial_row_key: array_row
   spatial_col_key: array_col
