@@ -503,13 +503,12 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             use_spatial_weighting=spatial_weighting_enabled,
             use_spatial_negative_filter=spatial_negative_filter_enabled,
             use_spatial_loss=spatial_enabled,
+            lambda_rec=lambda_rec,
+            lambda_mgcl=lambda_mgcl,
+            lambda_cluster=lambda_cluster,
+            lambda_spatial=lambda_spatial,
         )
-        total_loss = (
-            lambda_rec * output.reconstruction_loss
-            + lambda_mgcl * output.sample_contrastive_loss
-            + lambda_cluster * output.cluster_contrastive_loss
-            + lambda_spatial * output.spatial_loss
-        )
+        total_loss = output.total_loss
         if not torch.isfinite(total_loss):
             raise FloatingPointError(f"non-finite total loss at epoch {epoch_number}")
         optimizer.zero_grad(set_to_none=True)
@@ -543,6 +542,7 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             "sample_contrastive": _json_float(output.sample_contrastive_loss),
             "cluster_contrastive": _json_float(output.cluster_contrastive_loss),
             "spatial": _json_float(output.spatial_loss),
+            "spatial_loss": _json_float(output.spatial_loss),
             "lambda_rec": lambda_rec,
             "lambda_mgcl": lambda_mgcl,
             "lambda_cluster": lambda_cluster,
@@ -551,6 +551,10 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             "spatial_enabled": spatial_enabled,
             "spatial_weighting_enabled": spatial_weighting_enabled,
             "spatial_negative_filter_enabled": spatial_negative_filter_enabled,
+            "sc_enabled": spatial_weighting_enabled,
+            "snf_enabled": spatial_negative_filter_enabled,
+            "mgcl_weight_std": _json_float(output.mgcl_weight_std),
+            "neg_count": output.neg_count,
             "cluster_assignment_entropy": _json_float(
                 cluster_diagnostics["assignment_entropy"]
             ),
@@ -570,9 +574,12 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             f"total={record['total']:.6f} | rec={record['reconstruction']:.6f} | "
             f"mgcl={record['sample_contrastive']:.6f} | "
             f"cluster={record['cluster_contrastive']:.6f} | "
-            f"spatial={record['spatial']:.6f} | "
-            f"SC={'on' if record['spatial_weighting_enabled'] else 'off'} | "
-            f"SNF={'on' if record['spatial_negative_filter_enabled'] else 'off'} | "
+            f"spatial_loss={record['spatial_loss']:.6f} | "
+            f"lambda_spatial={record['lambda_spatial']:.3g} | "
+            f"sc_enabled={record['sc_enabled']} | "
+            f"snf_enabled={record['snf_enabled']} | "
+            f"mgcl_weight_std={record['mgcl_weight_std']:.3e} | "
+            f"neg_count={record['neg_count']} | "
             f"effC={record['cluster_effective_clusters']:.3f} | "
             f"gradC={record['cluster_head_gradient_norm']:.3e}"
         )
@@ -592,6 +599,10 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             use_spatial_weighting=spatial_weighting_enabled,
             use_spatial_negative_filter=spatial_negative_filter_enabled,
             use_spatial_loss=spatial_enabled,
+            lambda_rec=lambda_rec,
+            lambda_mgcl=lambda_mgcl,
+            lambda_cluster=lambda_cluster,
+            lambda_spatial=lambda_spatial,
         )
     clustering_options = dict(clustering_config)
     method = str(clustering_config.get("method", "kmeans"))

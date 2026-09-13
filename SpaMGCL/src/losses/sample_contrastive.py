@@ -96,6 +96,20 @@ class AdaptiveSampleContrastiveLoss(nn.Module):
             "ignore_mask": ignore_mask,
             "masked_positions": int(ignore_mask.sum().item()) if ignore_mask is not None else 0,
         }
+        # Count the off-diagonal candidates that remain in each pairwise
+        # denominator. The mask itself is unchanged; this is diagnostics only.
+        off_diagonal = ~torch.eye(
+            representations[0].shape[0],
+            dtype=torch.bool,
+            device=representations[0].device,
+        )
+        if ignore_mask is None:
+            valid_negative_mask = off_diagonal
+        else:
+            valid_negative_mask = off_diagonal & ~ignore_mask.to(
+                representations[0].device
+            )
+        debug["neg_count"] = int(valid_negative_mask.sum().item())
         for left_index in range(len(representations)):
             for right_index in range(left_index + 1, len(representations)):
                 pair_weight = weights[left_index] + weights[right_index]

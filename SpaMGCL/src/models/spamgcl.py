@@ -29,6 +29,8 @@ class SpaMGCLForwardOutput:
     spatial_consistency_scores: Tensor
     combined_distances: Tensor
     weights: Tensor
+    mgcl_weight_std: Tensor
+    neg_count: int
     weighted_representation: Tensor
     mean_representation: Tensor
     cluster_assignments: Sequence[Tensor]
@@ -108,7 +110,19 @@ class SpaMGCL(nn.Module):
         use_spatial_weighting: bool = True,
         use_spatial_negative_filter: bool = True,
         use_spatial_loss: bool = True,
+        lambda_rec: float = 1.0,
+        lambda_mgcl: float = 1.0,
+        lambda_cluster: float = 1.0,
+        lambda_spatial: float = 1.0,
     ) -> SpaMGCLForwardOutput:
+        loss_coefficients = (
+            lambda_rec,
+            lambda_mgcl,
+            lambda_cluster,
+            lambda_spatial,
+        )
+        if any(float(coefficient) < 0 for coefficient in loss_coefficients):
+            raise ValueError("loss coefficients must be nonnegative")
         modality_a_name = modality_a_name or self.modality_names[0]
         modality_b_name = modality_b_name or self.modality_names[1]
         gcn_views = self.gcn(
@@ -153,12 +167,13 @@ class SpaMGCL(nn.Module):
             [gcn_views[view_name] for view_name in self.view_order],
             reconstructions,
         )
-        sample_contrastive = self.sample_contrastive_loss(
+        sample_contrastive, sample_debug = self.sample_contrastive_loss(
             representations,
             weights,
             spatial_adjacency=(
                 spatial_adjacency if use_spatial_negative_filter else None
             ),
+            return_debug=True,
         )
         assignments = [
             self.cluster_head(multigranularity_views[view_name]["z"])
@@ -180,7 +195,12 @@ class SpaMGCL(nn.Module):
         )
         mean_representation = stacked_representations.mean(dim=0)
 
-        total = reconstruction + sample_contrastive + cluster_contrastive + spatial_loss
+        total = (
+            lambda_rec * reconstruction
+            + lambda_mgcl * sample_contrastive
+            + lambda_cluster * cluster_contrastive
+            + lambda_spatial * spatial_loss
+        )
         return SpaMGCLForwardOutput(
             total_loss=total,
             reconstruction_loss=reconstruction,
@@ -192,6 +212,8 @@ class SpaMGCL(nn.Module):
             spatial_consistency_scores=spatial_consistency_scores,
             combined_distances=combined_distances,
             weights=weights,
+            mgcl_weight_std=weights.detach().std(unbiased=False),
+            neg_count=int(sample_debug["neg_count"]),
             weighted_representation=weighted_representation,
             mean_representation=mean_representation,
             cluster_assignments=assignments,
