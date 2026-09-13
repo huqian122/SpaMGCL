@@ -31,6 +31,7 @@ class SpaMGCLForwardOutput:
     weights: Tensor
     mgcl_weight_std: Tensor
     neg_count: int
+    snf_masked_positions: int
     weighted_representation: Tensor
     mean_representation: Tensor
     cluster_assignments: Sequence[Tensor]
@@ -214,6 +215,7 @@ class SpaMGCL(nn.Module):
             weights=weights,
             mgcl_weight_std=weights.detach().std(unbiased=False),
             neg_count=int(sample_debug["neg_count"]),
+            snf_masked_positions=int(sample_debug["masked_positions"]),
             weighted_representation=weighted_representation,
             mean_representation=mean_representation,
             cluster_assignments=assignments,

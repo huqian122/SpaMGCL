@@ -555,6 +555,7 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             "snf_enabled": spatial_negative_filter_enabled,
             "mgcl_weight_std": _json_float(output.mgcl_weight_std),
             "neg_count": output.neg_count,
+            "snf_masked_positions": output.snf_masked_positions,
             "cluster_assignment_entropy": _json_float(
                 cluster_diagnostics["assignment_entropy"]
             ),
@@ -580,6 +581,7 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             f"snf_enabled={record['snf_enabled']} | "
             f"mgcl_weight_std={record['mgcl_weight_std']:.3e} | "
             f"neg_count={record['neg_count']} | "
+            f"snf_masked_positions={record['snf_masked_positions']} | "
             f"effC={record['cluster_effective_clusters']:.3f} | "
             f"gradC={record['cluster_head_gradient_norm']:.3e}"
         )

@@ -4,14 +4,29 @@
 
 - Audited the SC and `lambda_spatial` paths in the core runner.
 - Kept the existing SNF mask and denominator behavior unchanged; added only a
-  `neg_count` diagnostic for the remaining off-diagonal negative candidates.
+  `neg_count` diagnostic for the remaining off-diagonal negative candidates,
+  plus `snf_masked_positions` and `unfiltered_neg_count` diagnostics.
 - SC-aware view weights are still passed directly to the MGCL loss. Each epoch
   now records `mgcl_weight_std` so SC on/off runs can be compared quantitatively.
 - `SpaMGCLForwardOutput.total_loss` now uses the four coefficients supplied by
   the runner. The training objective is explicitly
   `rec + mgcl + cluster + lambda_spatial * spatial`.
 - Added stable loss-history fields: `lambda_spatial`, `spatial_loss`,
-  `sc_enabled`, `snf_enabled`, `mgcl_weight_std`, and `neg_count`.
+  `sc_enabled`, `snf_enabled`, `mgcl_weight_std`, `neg_count`, and
+  `snf_masked_positions`.
+
+## SNF audit
+
+- `experiments/run_exp.py:358-365` computes SNF independently from SC:
+  `spatial_negative_filter_enabled` depends on `spatial.enabled` and
+  `spatial.negative_filter`, not on `consistency_weighting`.
+- `src/models/spamgcl.py:170-177` passes `spatial_adjacency` to MGCL only when
+  the SNF flag is true.
+- `src/losses/sample_contrastive.py:87-121` converts non-diagonal spatial
+  edges into the ignore mask and fills those denominator logits with `-1e9`.
+  SNF therefore changes the negative set; it does not turn neighbors into
+  positives. The new counters expose both the masked and remaining candidate
+  counts without changing that behavior.
 
 No training was run in this change, and existing `results/` directories were
 not modified.
