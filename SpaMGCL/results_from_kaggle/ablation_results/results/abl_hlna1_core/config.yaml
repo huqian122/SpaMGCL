@@ -1,0 +1,61 @@
+clustering:
+  embedding: cluster_probabilities
+  method: argmax
+  n_clusters: 10
+data:
+  label_key: Spatial_Label
+  matrix_source: X
+  n_pca_components: 100
+  root: /kaggle/input/datasets/wuvdji/smgc-data
+  spatial_col_key: array_col
+  spatial_key: spatial
+  spatial_row_key: array_row
+experiment:
+  dataset: HLN-A1
+  epochs: 50
+  name: abl_hlna1_core
+  phase: DIAG_REPRESENTATION_CAPACITY
+  seed: 0
+  warm_up_epochs: 10
+graphs:
+  feature:
+    clip_negative: true
+    k: 20
+    symmetrize: true
+  spatial:
+    include_self: false
+    k: 3
+    symmetrize: true
+loss:
+  lambda_cluster: 0.1
+  lambda_mgcl: 1.0
+  lambda_rec: 1.0
+  lambda_spatial: 0.0
+model:
+  alpha: 0.5
+  cluster_regularization_weight: 1.0
+  cluster_temperature: 1.0
+  coarse_dim: 16
+  fine_dim: 32
+  fusion_hidden_dim: 64
+  gcn_hidden_dim: 32
+  num_clusters: 10
+  representation_dim: 16
+  tau_s: 0.3
+output:
+  root: results
+preprocessing:
+  log1p: false
+  standardize: false
+spatial:
+  consistency_weighting: false
+  enabled: false
+  negative_filter: false
+training:
+  cluster_head_init: none
+  cluster_head_lr_multiplier: 8.0
+  epochs: 50
+  lr: 0.001
+  spatial_start_epoch: 999
+  warm_up_epochs: 10
+  weight_decay: 1.0e-05
