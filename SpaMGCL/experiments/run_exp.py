@@ -178,6 +178,111 @@ def _gradient_norm(module: torch.nn.Module) -> float:
     return float(np.sqrt(squared_norm))
 
 
+def _model_forward(
+    model: SpaMGCL,
+    inputs: Mapping[str, torch.Tensor],
+    feature_tensors: Mapping[str, torch.Tensor],
+    spatial_tensor: torch.Tensor,
+    first_modality: str,
+    second_modality: str,
+    *,
+    use_spatial_weighting: bool,
+    use_spatial_negative_filter: bool,
+    use_spatial_loss: bool,
+    lambda_rec: float,
+    lambda_mgcl: float,
+    lambda_cluster: float,
+    lambda_spatial: float,
+) -> Any:
+    """Run the model with one explicit set of effective loss controls."""
+
+    return model(
+        inputs[first_modality],
+        spatial_tensor,
+        feature_tensors[first_modality],
+        inputs[second_modality],
+        spatial_tensor,
+        feature_tensors[second_modality],
+        spatial_tensor,
+        modality_a_name=first_modality,
+        modality_b_name=second_modality,
+        use_spatial_weighting=use_spatial_weighting,
+        use_spatial_negative_filter=use_spatial_negative_filter,
+        use_spatial_loss=use_spatial_loss,
+        lambda_rec=lambda_rec,
+        lambda_mgcl=lambda_mgcl,
+        lambda_cluster=lambda_cluster,
+        lambda_spatial=lambda_spatial,
+    )
+
+
+def _mean_q(output: Any) -> torch.Tensor:
+    """Return the mean cross-view Q matrix used by the final argmax partition."""
+
+    return torch.stack(list(output.cluster_assignments), dim=0).mean(dim=0)
+
+
+def _q_argmax_metrics(output: Any, labels: np.ndarray) -> Tuple[np.ndarray, Dict[str, float]]:
+    """Evaluate the required mean-Q argmax partition without training labels in the model."""
+
+    Q = _mean_q(output)
+    pred_labels = Q.argmax(dim=-1)
+    predicted = pred_labels.detach().cpu().numpy().astype(np.int64, copy=False)
+    return predicted, clustering_metrics(labels, predicted)
+
+
+def _save_checkpoint(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+) -> None:
+    """Save restart state at a requested milestone."""
+
+    state = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "python_rng_state": random.getstate(),
+        "numpy_rng_state": np.random.get_state(),
+        "torch_rng_state": torch.get_rng_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda_rng_state"] = torch.cuda.get_rng_state_all()
+    torch.save(state, path)
+
+
+def _write_metrics_snapshot(
+    output_dir: Path,
+    epoch: int,
+    history: Sequence[Mapping[str, Any]],
+    q_metrics: Mapping[str, float],
+) -> None:
+    """Write the compact milestone report without replacing final metrics.json."""
+
+    snapshot = {
+        "epoch": epoch,
+        "ARI": float(q_metrics["ARI"]),
+        "NMI": float(q_metrics["NMI"]),
+        "metrics": {key: float(value) for key, value in q_metrics.items()},
+        "loss_history": list(history),
+    }
+    (output_dir / f"metrics_epoch{epoch}.json").write_text(
+        json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _integer_label_array(labels: np.ndarray) -> np.ndarray:
+    """Persist GT labels as integers while keeping metric evaluation unchanged."""
+
+    array = np.asarray(labels)
+    try:
+        return array.astype(np.int64, copy=False)
+    except (TypeError, ValueError):
+        _, encoded = np.unique(array.astype(str), return_inverse=True)
+        return encoded.astype(np.int64, copy=False)
+
+
 def _embedding_from_output(output: Any, mode: str) -> torch.Tensor:
     """Select the representation that is actually sent to clustering."""
 
@@ -469,6 +574,13 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         f"({cluster_head_multiplier:g}x)"
     )
 
+    clustering_options = dict(clustering_config)
+    method = str(clustering_config.get("method", "kmeans"))
+    default_embedding = (
+        "cluster_probabilities" if method.lower() == "argmax" else "global"
+    )
+    embedding_mode = str(clustering_options.get("embedding", default_embedding))
+    milestone_epochs = {50, 100, 200}
     history = []
     cluster_head_init = str(training_config.get("cluster_head_init", "none")).lower()
     cluster_head_initialized = False
@@ -490,16 +602,13 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             cluster_enabled,
             spatial_enabled,
         ) = coefficients
-        output = model(
-            inputs[first_modality],
+        output = _model_forward(
+            model,
+            inputs,
+            feature_tensors,
             spatial_tensor,
-            feature_tensors[first_modality],
-            inputs[second_modality],
-            spatial_tensor,
-            feature_tensors[second_modality],
-            spatial_tensor,
-            modality_a_name=first_modality,
-            modality_b_name=second_modality,
+            first_modality,
+            second_modality,
             use_spatial_weighting=spatial_weighting_enabled,
             use_spatial_negative_filter=spatial_negative_filter_enabled,
             use_spatial_loss=spatial_enabled,
@@ -586,18 +695,60 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             f"gradC={record['cluster_head_gradient_norm']:.3e}"
         )
 
+        if epoch_number in milestone_epochs:
+            model.eval()
+            with torch.no_grad():
+                milestone_output = _model_forward(
+                    model,
+                    inputs,
+                    feature_tensors,
+                    spatial_tensor,
+                    first_modality,
+                    second_modality,
+                    use_spatial_weighting=spatial_weighting_enabled,
+                    use_spatial_negative_filter=spatial_negative_filter_enabled,
+                    use_spatial_loss=spatial_enabled,
+                    lambda_rec=lambda_rec,
+                    lambda_mgcl=lambda_mgcl,
+                    lambda_cluster=lambda_cluster,
+                    lambda_spatial=lambda_spatial,
+                )
+            milestone_embedding = (
+                _embedding_from_output(milestone_output, embedding_mode)
+                .detach()
+                .cpu()
+                .numpy()
+            )
+            milestone_predicted, _ = _cluster_embedding(
+                milestone_embedding,
+                num_clusters,
+                method=method,
+                seed=seed,
+            )
+            milestone_metrics = clustering_metrics(labels, milestone_predicted)
+            _write_metrics_snapshot(
+                output_dir,
+                epoch_number,
+                history,
+                milestone_metrics,
+            )
+            _save_checkpoint(
+                output_dir / f"checkpoint_epoch{epoch_number}.pt",
+                model,
+                optimizer,
+                epoch_number,
+            )
+            model.train()
+
     model.eval()
     with torch.no_grad():
-        final_output = model(
-            inputs[first_modality],
+        final_output = _model_forward(
+            model,
+            inputs,
+            feature_tensors,
             spatial_tensor,
-            feature_tensors[first_modality],
-            inputs[second_modality],
-            spatial_tensor,
-            feature_tensors[second_modality],
-            spatial_tensor,
-            modality_a_name=first_modality,
-            modality_b_name=second_modality,
+            first_modality,
+            second_modality,
             use_spatial_weighting=spatial_weighting_enabled,
             use_spatial_negative_filter=spatial_negative_filter_enabled,
             use_spatial_loss=spatial_enabled,
@@ -606,12 +757,6 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             lambda_cluster=lambda_cluster,
             lambda_spatial=lambda_spatial,
         )
-    clustering_options = dict(clustering_config)
-    method = str(clustering_config.get("method", "kmeans"))
-    default_embedding = (
-        "cluster_probabilities" if method.lower() == "argmax" else "global"
-    )
-    embedding_mode = str(clustering_options.get("embedding", default_embedding))
     embedding = _embedding_from_output(final_output, embedding_mode).detach().cpu().numpy()
     predicted, method_used = _cluster_embedding(
         embedding, num_clusters, method=method, seed=seed
@@ -638,15 +783,11 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             "method": candidate_method,
             **clustering_metrics(labels, candidate_predicted),
         }
-    q_probabilities = _embedding_from_output(
-        final_output, "cluster_probabilities"
-    ).detach().cpu().numpy()
-    q_predicted, q_method = _cluster_embedding(
-        q_probabilities,
-        num_clusters,
-        method="argmax",
-        seed=seed,
-    )
+    Q = _mean_q(final_output)
+    pred_labels = Q.argmax(dim=-1)
+    q_probabilities = Q.detach().cpu().numpy()
+    q_predicted = pred_labels.detach().cpu().numpy().astype(np.int64, copy=False)
+    q_method = "argmax"
     candidate_metrics["cluster_argmax"] = {
         "method": q_method,
         **clustering_metrics(labels, q_predicted),
@@ -681,6 +822,36 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
     final_cluster_diagnostics = model.cluster_contrastive_loss.diagnostics(
         final_output.cluster_assignments
     )
+
+    # Persist the exact arrays used by downstream reproducibility and plotting
+    # tools. ``embeddings`` follows the configured final clustering input;
+    # with the default argmax configuration this is mean(Q).
+    z_mean = _embedding_from_output(final_output, "mean_z").detach().cpu().numpy()
+    z_concat = _embedding_from_output(final_output, "concat_z").detach().cpu().numpy()
+    np.save(output_dir / "pred_labels.npy", q_predicted.astype(np.int64, copy=False))
+    np.save(output_dir / "gt_labels.npy", _integer_label_array(labels))
+    np.save(output_dir / "spot_ids.npy", np.asarray(sample.spot_ids, dtype=str))
+    np.save(
+        output_dir / "coords.npy",
+        np.asarray(sample.spatial_coordinates, dtype=np.float32),
+    )
+    np.save(output_dir / "embeddings.npy", np.asarray(embedding, dtype=np.float32))
+    np.save(output_dir / "z_mean.npy", np.asarray(z_mean, dtype=np.float32))
+    np.save(output_dir / "z_concat.npy", np.asarray(z_concat, dtype=np.float32))
+    np.save(
+        output_dir / "sc_weights.npy",
+        final_output.weights.detach().cpu().numpy().astype(np.float32, copy=False),
+    )
+    snf_stats = {
+        "neg_count": int(final_output.neg_count),
+        "snf_masked_positions": int(final_output.snf_masked_positions),
+        "sc_enabled": bool(spatial_weighting_enabled),
+        "snf_enabled": bool(spatial_negative_filter_enabled),
+    }
+    (output_dir / "snf_stats.json").write_text(
+        json.dumps(snf_stats, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    _save_checkpoint(output_dir / "checkpoint_last.pt", model, optimizer, epochs)
 
     output_config_path = output_dir / "config.yaml"
 
@@ -724,6 +895,19 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             },
         },
         "loss_history": history,
+        "artifacts": {
+            "pred_labels": str(output_dir / "pred_labels.npy"),
+            "gt_labels": str(output_dir / "gt_labels.npy"),
+            "spot_ids": str(output_dir / "spot_ids.npy"),
+            "coords": str(output_dir / "coords.npy"),
+            "embeddings": str(output_dir / "embeddings.npy"),
+            "z_mean": str(output_dir / "z_mean.npy"),
+            "z_concat": str(output_dir / "z_concat.npy"),
+            "sc_weights": str(output_dir / "sc_weights.npy"),
+            "snf_stats": str(output_dir / "snf_stats.json"),
+            "checkpoint_last": str(output_dir / "checkpoint_last.pt"),
+        },
+        "final_snf_stats": snf_stats,
     }
     metrics_path = output_dir / "metrics.json"
     metrics_path.write_text(

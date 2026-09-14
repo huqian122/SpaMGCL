@@ -59,3 +59,53 @@ reached. Do not reuse a result directory containing `metrics.json`.
 - Once spatial training is active, a nonzero `lambda_spatial` makes total loss
   differ from the non-spatial objective by exactly
   `lambda_spatial * spatial_loss`, up to floating-point rounding.
+
+## Reproducibility artifacts
+
+- `experiments/run_exp.py:696-739` writes `metrics_epoch50.json`,
+  `metrics_epoch100.json`, and `metrics_epoch200.json` when those milestones
+  are reached. Each snapshot contains the milestone ARI/NMI and the loss
+  history through that epoch.
+- `experiments/run_exp.py:826-854` writes the final prediction, GT labels,
+  spot IDs, coordinates, clustering input, `mean_z`, `concat_z`, SC/WD view
+  weights, and SNF statistics. The final matrix is named `Q` in the runner,
+  and `pred_labels.npy` is explicitly `Q.argmax(dim=-1)` with shape
+  `(n_spots,)`.
+- The same block writes `checkpoint_epoch50.pt`, `checkpoint_epoch100.pt`,
+  and `checkpoint_epoch200.pt` at reached milestones, plus
+  `checkpoint_last.pt`. Checkpoints contain model state, optimizer state,
+  epoch, and Python/NumPy/PyTorch RNG states.
+- All files are written below the reserved `output.root / experiment.name`
+  directory. The existing output reservation still rejects a directory that
+  already contains `metrics.json`; no timestamp or historical result is
+  overwritten.
+
+## Artifact smoke checks
+
+These commands are for Kaggle and were not run here:
+
+```bash
+python -m py_compile experiments/run_exp.py
+python experiments/run_exp.py --config configs/hlna1_best.yaml
+python - <<'PY'
+import json
+from pathlib import Path
+import numpy as np
+
+out = Path("results/hlna1_best")
+required = [
+    "pred_labels.npy", "gt_labels.npy", "spot_ids.npy", "coords.npy",
+    "embeddings.npy", "z_mean.npy", "z_concat.npy", "sc_weights.npy",
+    "snf_stats.json", "metrics_epoch50.json", "metrics.json",
+]
+for name in required:
+    assert (out / name).is_file(), name
+    print(name, end=" ")
+print()
+snapshot = json.loads((out / "metrics_epoch50.json").read_text())
+final = json.loads((out / "metrics.json").read_text())
+assert np.isclose(snapshot["ARI"], final["ARI"])
+assert np.isclose(snapshot["NMI"], final["NMI"])
+print("artifact_smoke_ok")
+PY
+```
