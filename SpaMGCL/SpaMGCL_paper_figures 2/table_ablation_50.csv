@@ -1,0 +1,13 @@
+﻿dataset,variant,epochs,run,Q_argmax_ARI,Q_argmax_NMI,concat_z_ARI,concat_z_NMI
+HLN-A1,core,50,abl_hlna1_core,0.2892,0.3536,0.2403,0.3355
+HLN-A1,no_sample,50,abl_hlna1_no_sample,0.0518,0.0622,0.0633,0.1216
+HLN-A1,no_cluster,50,abl_hlna1_no_cluster,0.0492,0.0969,0.2414,0.3365
+HLN-A1,sc,50,abl_hlna1_sc,0.2881,0.3529,0.2417,0.3374
+HLN-A1,snf,50,abl_hlna1_snf,0.2895,0.3538,0.2386,0.3346
+HLN-A1,sc_snf,50,abl_hlna1_sc_snf,0.2881,0.3531,0.2414,0.3373
+E18.5,core,50,abl_e185_core,0.4961,0.4717,0.3959,0.5115
+E18.5,no_sample,50,abl_e185_no_sample,0.1344,0.2602,0.2018,0.2889
+E18.5,no_cluster,50,abl_e185_no_cluster,0.0194,0.0218,0.4446,0.5381
+E18.5,sc,50,abl_e185_sc,0.4915,0.4694,0.3943,0.506
+E18.5,snf,50,abl_e185_snf,0.4931,0.4721,0.3669,0.4969
+E18.5,sc_snf,50,abl_e185_sc_snf,0.4994,0.4738,0.3769,0.4967

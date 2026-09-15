@@ -1,0 +1,6 @@
+﻿dataset,variant,epochs,run,Q_argmax_ARI,Q_argmax_NMI,concat_z_ARI,concat_z_NMI
+HLN-A1,core,200,hlna1_core_200,0.1819,0.3023,0.2287,0.36
+E18.5,core,200,e185_core_200,0.3335,0.5184,0.3574,0.5586
+HLN-D1,core,200,d1_core_200,0.1784,0.2898,0.2671,0.3458
+S2-E15,core,200,s2e15_core_200,0.2866,0.5018,0.3402,0.5344
+S2-E18,core,200,s2e18_core_200,0.2699,0.4547,0.3319,0.508
