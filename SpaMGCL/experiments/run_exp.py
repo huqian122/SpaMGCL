@@ -27,6 +27,7 @@ import torch
 import yaml
 
 from src.clustering.predict import cluster_embedding, clustering_metrics
+from src.clustering.refinement import apply_embedding_refinement
 from src.data.dataset import load_spatial_multiomics, sample_summary
 from src.data.preprocessing import prepare_features
 from src.graphs.feature_graph import build_feature_graph
@@ -302,6 +303,8 @@ def _write_metrics_snapshot(
     metrics: Mapping[str, float],
     *,
     nmi_average_method: str,
+    official_readout: Mapping[str, Any],
+    refinement: Mapping[str, Any],
 ) -> None:
     """Write the compact milestone report without replacing final metrics.json."""
 
@@ -310,6 +313,8 @@ def _write_metrics_snapshot(
         "ARI": float(metrics["ARI"]),
         "NMI": float(metrics["NMI"]),
         "nmi_average_method": nmi_average_method,
+        "official_readout": dict(official_readout),
+        "refinement": dict(refinement),
         "metrics": {key: float(value) for key, value in metrics.items()},
         "loss_history": list(history),
     }
@@ -385,6 +390,18 @@ def _nmi_average_method(config: Mapping[str, Any]) -> str:
     return method
 
 
+def _refinement_settings(config: Mapping[str, Any]) -> Tuple[bool, str, int]:
+    refinement = _section(config, "refinement")
+    enabled = bool(refinement.get("enabled", False))
+    method = str(refinement.get("method", "bsrr")).lower()
+    spatial_k = int(refinement.get("spatial_k", 3))
+    if method != "bsrr":
+        raise ValueError("refinement.method must be 'bsrr'")
+    if spatial_k < 1:
+        raise ValueError("refinement.spatial_k must be positive")
+    return enabled, method, spatial_k
+
+
 def _embedding_from_output(output: Any, mode: str) -> torch.Tensor:
     """Select the representation that is actually sent to clustering."""
 
@@ -423,7 +440,9 @@ def _cluster_embedding(
     n_clusters: int,
     *,
     method: str,
-    seed: int,
+    n_init: int,
+    random_state: int,
+    mclust_seed: int = 0,
 ) -> Tuple[np.ndarray, str]:
     """Cluster a representation, including MGCMVC's direct Q argmax path."""
 
@@ -433,7 +452,42 @@ def _cluster_embedding(
                 "argmax clustering requires an N x n_clusters probability matrix"
             )
         return np.argmax(embedding, axis=1), "argmax"
-    return cluster_embedding(embedding, n_clusters, method=method, seed=seed)
+    return cluster_embedding(
+        embedding,
+        n_clusters,
+        method=method,
+        seed=mclust_seed,
+        n_init=n_init,
+        random_state=random_state,
+    )
+
+
+def _official_readout(
+    z_concat: np.ndarray,
+    coordinates: np.ndarray,
+    n_clusters: int,
+    *,
+    kmeans_n_init: int,
+    kmeans_random_state: int,
+    refinement_enabled: bool,
+    refinement_method: str,
+    refinement_spatial_k: int,
+) -> Tuple[np.ndarray, np.ndarray, str, Dict[str, Any]]:
+    final_embedding, refinement_diagnostics = apply_embedding_refinement(
+        z_concat,
+        coordinates,
+        enabled=refinement_enabled,
+        method=refinement_method,
+        spatial_k=refinement_spatial_k,
+    )
+    predicted, method_used = _cluster_embedding(
+        final_embedding,
+        n_clusters,
+        method="kmeans",
+        n_init=kmeans_n_init,
+        random_state=kmeans_random_state,
+    )
+    return final_embedding, predicted, method_used, refinement_diagnostics
 
 
 def _build_model_config(config: Mapping[str, Any], num_clusters: int) -> Dict[str, Any]:
@@ -698,11 +752,27 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
     clustering_options = dict(clustering_config)
     method = str(clustering_config.get("method", "kmeans")).lower()
     embedding_mode = str(clustering_options.get("embedding", "concat_z")).lower()
+    kmeans_n_init = int(clustering_config.get("n_init", 20))
+    kmeans_random_state = int(clustering_config.get("random_state", 0))
+    if kmeans_n_init < 1:
+        raise ValueError("clustering.n_init must be positive")
     if method != "kmeans" or embedding_mode != "concat_z":
         raise ValueError(
             "Formal readout is fixed to clustering.method=kmeans and "
             "clustering.embedding=concat_z; Q argmax is diagnostic only"
         )
+    refinement_enabled, refinement_method, refinement_spatial_k = (
+        _refinement_settings(config)
+    )
+    official_readout_metadata = {
+        "embedding": "concat_z",
+        "refinement_enabled": refinement_enabled,
+        "refinement_method": refinement_method,
+        "clustering_method": "kmeans",
+    }
+    clustering_coordinates = np.asarray(
+        sample.spatial_coordinates, dtype=np.float32
+    )
     milestone_epochs = {50, 100, 200}
     history = []
     cluster_head_init = str(training_config.get("cluster_head_init", "none")).lower()
@@ -857,17 +927,26 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
                     lambda_cluster=lambda_cluster,
                     lambda_spatial=lambda_spatial,
                 )
-            milestone_embedding = (
-                _embedding_from_output(milestone_output, embedding_mode)
+            milestone_z_concat = (
+                _embedding_from_output(milestone_output, "concat_z")
                 .detach()
                 .cpu()
                 .numpy()
             )
-            milestone_predicted, _ = _cluster_embedding(
-                milestone_embedding,
+            (
+                _,
+                milestone_predicted,
+                _,
+                milestone_refinement,
+            ) = _official_readout(
+                milestone_z_concat,
+                clustering_coordinates,
                 num_clusters,
-                method=method,
-                seed=seed,
+                kmeans_n_init=kmeans_n_init,
+                kmeans_random_state=kmeans_random_state,
+                refinement_enabled=refinement_enabled,
+                refinement_method=refinement_method,
+                refinement_spatial_k=refinement_spatial_k,
             )
             milestone_metrics = clustering_metrics(
                 labels,
@@ -880,6 +959,8 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
                 history,
                 milestone_metrics,
                 nmi_average_method=nmi_average_method,
+                official_readout=official_readout_metadata,
+                refinement=milestone_refinement,
             )
             _save_checkpoint(
                 output_dir / f"checkpoint_epoch{epoch_number}.pt",
@@ -908,11 +989,23 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         )
     z_mean = _embedding_from_output(final_output, "mean_z").detach().cpu().numpy()
     z_concat = _embedding_from_output(final_output, "concat_z").detach().cpu().numpy()
-    embedding = z_concat
-    pred_concat_z_kmeans, method_used = _cluster_embedding(
-        z_concat, num_clusters, method="kmeans", seed=seed
+    pred_concat_z_kmeans, _ = _cluster_embedding(
+        z_concat,
+        num_clusters,
+        method="kmeans",
+        n_init=kmeans_n_init,
+        random_state=kmeans_random_state,
     )
-    predicted = pred_concat_z_kmeans
+    embedding, predicted, method_used, refinement_diagnostics = _official_readout(
+        z_concat,
+        clustering_coordinates,
+        num_clusters,
+        kmeans_n_init=kmeans_n_init,
+        kmeans_random_state=kmeans_random_state,
+        refinement_enabled=refinement_enabled,
+        refinement_method=refinement_method,
+        refinement_spatial_k=refinement_spatial_k,
+    )
     metrics = clustering_metrics(
         labels, predicted, nmi_average_method=nmi_average_method
     )
@@ -931,7 +1024,8 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             candidate_embedding,
             num_clusters,
             method="kmeans",
-            seed=seed,
+            n_init=kmeans_n_init,
+            random_state=kmeans_random_state,
         )
         candidate_metrics[candidate_mode] = {
             "method": candidate_method,
@@ -960,7 +1054,11 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             .numpy()
         )
         z_predicted, z_method = _cluster_embedding(
-            z_embedding, num_clusters, method="kmeans", seed=seed
+            z_embedding,
+            num_clusters,
+            method="kmeans",
+            n_init=kmeans_n_init,
+            random_state=kmeans_random_state,
         )
         z_view_metrics[view_name] = {
             "method": z_method,
@@ -973,7 +1071,11 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
     for z_mode in ("mean_z", "concat_z"):
         z_embedding = _embedding_from_output(final_output, z_mode).detach().cpu().numpy()
         z_predicted, z_method = _cluster_embedding(
-            z_embedding, num_clusters, method="kmeans", seed=seed
+            z_embedding,
+            num_clusters,
+            method="kmeans",
+            n_init=kmeans_n_init,
+            random_state=kmeans_random_state,
         )
         representation_metrics[z_mode] = {
             "method": z_method,
@@ -986,16 +1088,26 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         final_output.cluster_assignments
     )
 
-    # Persist the exact arrays used by downstream reproducibility and plotting
-    # tools. The official readout is always concat(Z_v) followed by KMeans;
-    # Q argmax is retained as a diagnostic partition only.
+    # Persist both the raw concat-Z diagnostic and the exact official readout.
+    # Q argmax remains a diagnostic partition only.
     gt_labels = _integer_label_array(labels)
-    if not np.array_equal(predicted, pred_concat_z_kmeans):
-        raise RuntimeError("official predictions differ from concat_z KMeans")
-    if predicted.shape[0] != gt_labels.shape[0] or z_concat.shape[0] != gt_labels.shape[0]:
+    if (
+        predicted.shape[0] != gt_labels.shape[0]
+        or z_concat.shape[0] != gt_labels.shape[0]
+    ):
         raise RuntimeError("prediction, embedding, and ground-truth lengths differ")
-    if not np.isfinite(z_concat).all():
-        raise RuntimeError("concat_z contains NaN or Inf")
+    if embedding.shape[0] != gt_labels.shape[0]:
+        raise RuntimeError("official embedding and ground-truth lengths differ")
+    if not np.isfinite(z_concat).all() or not np.isfinite(embedding).all():
+        raise RuntimeError("clustering embedding contains NaN or Inf")
+    if refinement_enabled:
+        if not bool(refinement_diagnostics["enabled"]):
+            raise RuntimeError("BSRR is enabled but refinement diagnostics disagree")
+    else:
+        if not np.array_equal(embedding, z_concat):
+            raise RuntimeError("disabled refinement changed concat_z")
+        if not np.array_equal(predicted, pred_concat_z_kmeans):
+            raise RuntimeError("disabled refinement changed concat_z KMeans predictions")
     if int(model_config["num_clusters"]) != int(clustering_config["n_clusters"]):
         raise RuntimeError("model.num_clusters and clustering.n_clusters differ")
     for modality, spot_ids in sample.modality_spot_ids.items():
@@ -1012,17 +1124,22 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             )
 
     np.save(output_dir / "pred_labels.npy", predicted.astype(np.int64, copy=False))
-    np.save(output_dir / "pred_concat_z_kmeans.npy", predicted.astype(np.int64, copy=False))
+    np.save(
+        output_dir / "pred_concat_z_kmeans.npy",
+        pred_concat_z_kmeans.astype(np.int64, copy=False),
+    )
     np.save(output_dir / "pred_q_argmax.npy", q_predicted.astype(np.int64, copy=False))
     np.save(output_dir / "gt_labels.npy", gt_labels)
     np.save(output_dir / "spot_ids.npy", np.asarray(sample.spot_ids, dtype=str))
     np.save(
         output_dir / "coords.npy",
-        np.asarray(sample.spatial_coordinates, dtype=np.float32),
+        clustering_coordinates,
     )
     np.save(output_dir / "embeddings.npy", np.asarray(embedding, dtype=np.float32))
     np.save(output_dir / "z_mean.npy", np.asarray(z_mean, dtype=np.float32))
     np.save(output_dir / "z_concat.npy", np.asarray(z_concat, dtype=np.float32))
+    if refinement_enabled:
+        np.save(output_dir / "z_bsrr.npy", np.asarray(embedding, dtype=np.float32))
     np.save(
         output_dir / "sc_weights.npy",
         final_output.weights.detach().cpu().numpy().astype(np.float32, copy=False),
@@ -1052,7 +1169,8 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         "spatial_weighting_enabled": spatial_weighting_enabled,
         "spatial_negative_filter_enabled": spatial_negative_filter_enabled,
         "nmi_average_method": nmi_average_method,
-        "official_readout": "concat_z + kmeans",
+        "official_readout": official_readout_metadata,
+        "refinement": refinement_diagnostics,
         "cluster_warm_up_epochs": warm_up_epochs,
         "cluster_loss_start_epoch": warm_up_epochs + 1,
         "configured_loss": {
@@ -1078,7 +1196,13 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
                 "method": method,
                 "embedding": embedding_mode,
                 "n_clusters": num_clusters,
-                "n_init": 20,
+                "n_init": kmeans_n_init,
+                "random_state": kmeans_random_state,
+            },
+            "refinement": {
+                "enabled": refinement_enabled,
+                "method": refinement_method,
+                "spatial_k": refinement_spatial_k,
             },
         },
         "resolved_loss_coefficients": {
@@ -1128,6 +1252,11 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             "embeddings": str(output_dir / "embeddings.npy"),
             "z_mean": str(output_dir / "z_mean.npy"),
             "z_concat": str(output_dir / "z_concat.npy"),
+            **(
+                {"z_bsrr": str(output_dir / "z_bsrr.npy")}
+                if refinement_enabled
+                else {}
+            ),
             "sc_weights": str(output_dir / "sc_weights.npy"),
             "snf_stats": str(output_dir / "snf_stats.json"),
             "checkpoint_last": str(output_dir / "checkpoint_last.pt"),

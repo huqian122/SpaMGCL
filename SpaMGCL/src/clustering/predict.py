@@ -7,10 +7,20 @@ from typing import Any, Dict, Tuple
 import numpy as np
 
 
-def _kmeans(embedding: np.ndarray, n_clusters: int, seed: int) -> np.ndarray:
+def _kmeans(
+    embedding: np.ndarray,
+    n_clusters: int,
+    *,
+    n_init: int,
+    random_state: int,
+) -> np.ndarray:
     from sklearn.cluster import KMeans
 
-    model = KMeans(n_clusters=n_clusters, n_init=20, random_state=seed)
+    model = KMeans(
+        n_clusters=n_clusters,
+        n_init=n_init,
+        random_state=random_state,
+    )
     return model.fit_predict(embedding)
 
 
@@ -34,8 +44,14 @@ def cluster_embedding(
     *,
     method: str = "kmeans",
     seed: int = 0,
+    n_init: int = 20,
+    random_state: int = 0,
 ) -> Tuple[np.ndarray, str]:
-    """Cluster an embedding and return labels plus the method actually used."""
+    """Cluster an embedding and return labels plus the method actually used.
+
+    ``seed`` controls mclust only. KMeans uses its explicit ``n_init`` and
+    ``random_state`` arguments.
+    """
 
     matrix = np.asarray(embedding, dtype=np.float32)
     if matrix.ndim != 2 or matrix.shape[0] == 0:
@@ -48,10 +64,26 @@ def cluster_embedding(
         try:
             return _mclust(matrix, n_clusters, seed), "mclust"
         except (ImportError, ModuleNotFoundError, RuntimeError, OSError):
-            return _kmeans(matrix, n_clusters, seed), "kmeans_fallback_for_mclust"
+            return (
+                _kmeans(
+                    matrix,
+                    n_clusters,
+                    n_init=n_init,
+                    random_state=random_state,
+                ),
+                "kmeans_fallback_for_mclust",
+            )
     if requested != "kmeans":
         raise ValueError("clustering method must be 'kmeans' or 'mclust'")
-    return _kmeans(matrix, n_clusters, seed), "kmeans"
+    return (
+        _kmeans(
+            matrix,
+            n_clusters,
+            n_init=n_init,
+            random_state=random_state,
+        ),
+        "kmeans",
+    )
 
 
 def clustering_metrics(

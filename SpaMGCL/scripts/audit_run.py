@@ -15,7 +15,10 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.clustering.predict import clustering_metrics
+from src.clustering.predict import cluster_embedding, clustering_metrics
+from src.clustering.refinement import (
+    boundary_aware_spatial_residual_refinement,
+)
 
 
 def _section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
@@ -47,6 +50,7 @@ def audit_run(output_dir: Path) -> None:
     training = _section(config, "training")
     loss = _section(config, "loss")
     clustering = _section(config, "clustering")
+    refinement = _section(config, "refinement")
     evaluation = _section(config, "evaluation")
     nmi_average_method = str(evaluation.get("nmi_average_method", "max")).lower()
     warm_up_epochs = int(
@@ -100,6 +104,7 @@ def audit_run(output_dir: Path) -> None:
     z_concat = np.load(output_dir / "z_concat.npy")
     pred_q = np.load(output_dir / "pred_q_argmax.npy")
     pred_concat = np.load(output_dir / "pred_concat_z_kmeans.npy")
+    coords = np.load(output_dir / "coords.npy")
 
     if pred.ndim != 1 or gt.ndim != 1 or pred_q.ndim != 1:
         raise AssertionError("label arrays must be one-dimensional")
@@ -109,14 +114,132 @@ def audit_run(output_dir: Path) -> None:
         raise AssertionError("z_concat shape is inconsistent with GT labels")
     if not np.isfinite(z_concat).all():
         raise AssertionError("z_concat contains NaN or Inf")
-    if not np.array_equal(pred, pred_concat):
-        raise AssertionError("pred_labels.npy is not concat_z KMeans output")
-    if clustering.get("method") != "kmeans" or clustering.get("embedding") != "concat_z":
+    if coords.shape != (len(gt), 2) or not np.isfinite(coords).all():
+        raise AssertionError("coords shape or values are invalid")
+    if (
+        clustering.get("method") != "kmeans"
+        or clustering.get("embedding") != "concat_z"
+    ):
         raise AssertionError("config does not declare concat_z + kmeans")
     if int(_section(config, "model").get("num_clusters")) != int(
         clustering.get("n_clusters")
     ):
         raise AssertionError("model and clustering cluster counts differ")
+
+    n_clusters = int(clustering["n_clusters"])
+    n_init = int(clustering["n_init"])
+    random_state = int(clustering["random_state"])
+    resolved_parameters = metrics.get("resolved_parameters")
+    if not isinstance(resolved_parameters, Mapping):
+        raise AssertionError("metrics.json is missing resolved_parameters")
+    resolved_clustering = resolved_parameters.get("clustering")
+    if not isinstance(resolved_clustering, Mapping):
+        raise AssertionError("metrics.json is missing resolved_parameters.clustering")
+    expected_clustering = {
+        "method": str(clustering["method"]),
+        "embedding": str(clustering["embedding"]),
+        "n_clusters": n_clusters,
+        "n_init": n_init,
+        "random_state": random_state,
+    }
+    for key, expected in expected_clustering.items():
+        if resolved_clustering.get(key) != expected:
+            raise AssertionError(
+                f"resolved_parameters.clustering.{key} differs from config"
+            )
+    recomputed_raw_pred, raw_method = cluster_embedding(
+        z_concat,
+        n_clusters,
+        method="kmeans",
+        n_init=n_init,
+        random_state=random_state,
+    )
+    if raw_method != "kmeans" or not np.array_equal(
+        recomputed_raw_pred, pred_concat
+    ):
+        raise AssertionError("pred_concat_z_kmeans.npy is not reproducible")
+
+    refinement_enabled = bool(refinement.get("enabled", False))
+    refinement_method = str(refinement.get("method", "bsrr")).lower()
+    refinement_spatial_k = int(refinement.get("spatial_k", 3))
+    official_readout = metrics.get("official_readout")
+    metric_refinement = metrics.get("refinement")
+    if not isinstance(official_readout, Mapping):
+        raise AssertionError("metrics.json is missing official_readout metadata")
+    if not isinstance(metric_refinement, Mapping):
+        raise AssertionError("metrics.json is missing refinement diagnostics")
+    expected_readout = {
+        "embedding": "concat_z",
+        "refinement_enabled": refinement_enabled,
+        "refinement_method": refinement_method,
+        "clustering_method": "kmeans",
+    }
+    for key, expected in expected_readout.items():
+        if official_readout.get(key) != expected:
+            raise AssertionError(f"official_readout.{key} differs from config")
+    if bool(metric_refinement.get("enabled")) != refinement_enabled:
+        raise AssertionError("refinement.enabled differs between config and metrics")
+    if str(metric_refinement.get("method", "")).lower() != refinement_method:
+        raise AssertionError("refinement.method differs between config and metrics")
+    if int(metric_refinement.get("spatial_k")) != refinement_spatial_k:
+        raise AssertionError("refinement.spatial_k differs between config and metrics")
+
+    if refinement_enabled:
+        if refinement_method != "bsrr":
+            raise AssertionError("enabled refinement method must be bsrr")
+        z_bsrr = np.load(output_dir / "z_bsrr.npy")
+        recomputed_bsrr, recomputed_refinement = (
+            boundary_aware_spatial_residual_refinement(
+                z_concat, coords, spatial_k=refinement_spatial_k
+            )
+        )
+        if z_bsrr.shape != z_concat.shape or not np.isfinite(z_bsrr).all():
+            raise AssertionError("z_bsrr shape or values are invalid")
+        if not np.allclose(z_bsrr, recomputed_bsrr):
+            raise AssertionError("z_bsrr.npy does not reproduce BSRR")
+        for key in (
+            "sigma_spatial",
+            "sigma_latent",
+            "confidence_mean",
+            "confidence_std",
+            "confidence_min",
+            "confidence_max",
+        ):
+            _check_close(
+                float(metric_refinement[key]),
+                float(recomputed_refinement[key]),
+                f"refinement.{key}",
+            )
+        recomputed_official_pred, official_method = cluster_embedding(
+            z_bsrr,
+            n_clusters,
+            method="kmeans",
+            n_init=n_init,
+            random_state=random_state,
+        )
+    else:
+        if (output_dir / "z_bsrr.npy").exists():
+            raise AssertionError("disabled refinement unexpectedly saved z_bsrr.npy")
+        if any(
+            metric_refinement.get(key) is not None
+            for key in (
+                "sigma_spatial",
+                "sigma_latent",
+                "confidence_mean",
+                "confidence_std",
+                "confidence_min",
+                "confidence_max",
+            )
+        ):
+            raise AssertionError("disabled refinement has non-null diagnostics")
+        recomputed_official_pred = recomputed_raw_pred
+        official_method = raw_method
+        if not np.array_equal(pred, pred_concat):
+            raise AssertionError("disabled refinement did not use raw concat-Z")
+    if official_method != "kmeans" or not np.array_equal(
+        recomputed_official_pred, pred
+    ):
+        raise AssertionError("pred_labels.npy is not the configured official readout")
 
     recomputed = clustering_metrics(
         gt, pred, nmi_average_method=nmi_average_method
@@ -150,6 +273,11 @@ def audit_run(output_dir: Path) -> None:
     print(f"Configured lambda_cluster: {configured_lambda_cluster}")
     print(f"Official embedding: {metrics.get('clustering_embedding')}")
     print(f"Official clustering method: {metrics.get('clustering_method_used')}")
+    print(f"KMeans n_init: {n_init}")
+    print(f"KMeans random_state: {random_state}")
+    print(f"Refinement enabled: {refinement_enabled}")
+    print(f"Refinement method: {refinement_method}")
+    print(f"Refinement spatial_k: {refinement_spatial_k}")
     print(f"Epochs: {epochs}")
     print(f"lambda_rec: {loss.get('lambda_rec')}")
     print(f"lambda_mgcl: {loss.get('lambda_mgcl')}")
@@ -172,7 +300,14 @@ def main() -> int:
     args = parser.parse_args()
     try:
         audit_run(args.output_dir.resolve())
-    except (AssertionError, KeyError, OSError, TypeError, ValueError) as exc:
+    except (
+        AssertionError,
+        KeyError,
+        OSError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ) as exc:
         print(f"FAIL: {exc}", file=sys.stderr)
         return 1
     return 0
