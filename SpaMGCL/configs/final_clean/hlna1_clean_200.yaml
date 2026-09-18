@@ -65,9 +65,16 @@ clustering:
   method: kmeans
   embedding: concat_z
   n_clusters: 10
+  n_init: 20
+  random_state: 0
 
 evaluation:
   nmi_average_method: max
+
+refinement:
+  enabled: true
+  method: bsrr
+  spatial_k: 3
 
 output:
   root: results_clean
