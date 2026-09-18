@@ -70,6 +70,8 @@ class SpatialMultiOmicsSample:
     modality_paths: Dict[str, Path]
     label_key: Optional[str]
     spatial_source: str
+    modality_raw_shapes: Dict[str, Tuple[int, int]]
+    modality_spot_ids: Dict[str, np.ndarray]
 
     @property
     def n_spots(self) -> int:
@@ -204,8 +206,10 @@ def load_spatial_multiomics(
                 )
 
         features = {}
+        raw_shapes: Dict[str, Tuple[int, int]] = {}
         for modality, adata in adatas.items():
             matrix = _matrix_to_numpy(_get_matrix(adata, matrix_source))
+            raw_shapes[modality] = tuple(int(value) for value in matrix.shape)
             reduced = _pca_features(matrix, modality, n_pca_components)
             features[modality] = reduced
         coordinates = extract_spatial_coordinates(
@@ -230,6 +234,11 @@ def load_spatial_multiomics(
             modality_paths=paths,
             label_key=resolved_label_key,
             spatial_source=coordinates.source,
+            modality_raw_shapes=raw_shapes,
+            modality_spot_ids={
+                modality: np.asarray([str(value) for value in adata.obs_names])
+                for modality, adata in adatas.items()
+            },
         )
     finally:
         for adata in adatas.values():
@@ -248,6 +257,10 @@ def sample_summary(sample: SpatialMultiOmicsSample) -> Mapping[str, Any]:
             name: {"shape": list(features.shape), "dtype": str(features.dtype)}
             for name, features in sample.modality_features.items()
         },
+        "raw_shapes": {
+            name: list(shape) for name, shape in sample.modality_raw_shapes.items()
+        },
+        "spot_id_order_verified": True,
         "spatial_source": sample.spatial_source,
         "label_key": sample.label_key,
         "modality_paths": {name: str(path) for name, path in sample.modality_paths.items()},

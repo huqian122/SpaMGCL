@@ -8,10 +8,11 @@ the largest ATAC matrices has been measured.
 from __future__ import annotations
 
 import argparse
+import importlib.metadata
 import json
 import os
+import platform
 import random
-import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
@@ -113,9 +114,44 @@ def _prepare_output_dir(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     snapshot_path = output_dir / "config.yaml"
-    if config_path.resolve() != snapshot_path.resolve():
-        shutil.copy2(config_path, snapshot_path)
+    snapshot_path.write_text(
+        yaml.safe_dump(dict(config), sort_keys=False, allow_unicode=True),
+        encoding="utf-8",
+    )
     return root, output_dir
+
+
+def _package_version(distribution: str, module: Any = None) -> str:
+    """Return an installed package version without making optional deps required."""
+
+    try:
+        return importlib.metadata.version(distribution)
+    except importlib.metadata.PackageNotFoundError:
+        value = getattr(module, "__version__", None)
+        return str(value) if value is not None else "unavailable"
+
+
+def _write_manifest(
+    output_dir: Path,
+    *,
+    config_path: Path,
+    device: torch.device,
+) -> None:
+    manifest = {
+        "project_root": str(PROJECT_ROOT),
+        "python_version": platform.python_version(),
+        "torch_version": str(torch.__version__),
+        "numpy_version": _package_version("numpy", np),
+        "scipy_version": _package_version("scipy"),
+        "sklearn_version": _package_version("scikit-learn"),
+        "anndata_version": _package_version("anndata"),
+        "device": str(device),
+        "cuda_version": torch.version.cuda,
+        "source_config_path": str(config_path.resolve()),
+    }
+    (output_dir / "manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def _seed_everything(seed: int) -> None:
@@ -222,13 +258,20 @@ def _mean_q(output: Any) -> torch.Tensor:
     return torch.stack(list(output.cluster_assignments), dim=0).mean(dim=0)
 
 
-def _q_argmax_metrics(output: Any, labels: np.ndarray) -> Tuple[np.ndarray, Dict[str, float]]:
+def _q_argmax_metrics(
+    output: Any,
+    labels: np.ndarray,
+    *,
+    nmi_average_method: str = "max",
+) -> Tuple[np.ndarray, Dict[str, float]]:
     """Evaluate the required mean-Q argmax partition without training labels in the model."""
 
     Q = _mean_q(output)
     pred_labels = Q.argmax(dim=-1)
     predicted = pred_labels.detach().cpu().numpy().astype(np.int64, copy=False)
-    return predicted, clustering_metrics(labels, predicted)
+    return predicted, clustering_metrics(
+        labels, predicted, nmi_average_method=nmi_average_method
+    )
 
 
 def _save_checkpoint(
@@ -256,15 +299,18 @@ def _write_metrics_snapshot(
     output_dir: Path,
     epoch: int,
     history: Sequence[Mapping[str, Any]],
-    q_metrics: Mapping[str, float],
+    metrics: Mapping[str, float],
+    *,
+    nmi_average_method: str,
 ) -> None:
     """Write the compact milestone report without replacing final metrics.json."""
 
     snapshot = {
         "epoch": epoch,
-        "ARI": float(q_metrics["ARI"]),
-        "NMI": float(q_metrics["NMI"]),
-        "metrics": {key: float(value) for key, value in q_metrics.items()},
+        "ARI": float(metrics["ARI"]),
+        "NMI": float(metrics["NMI"]),
+        "nmi_average_method": nmi_average_method,
+        "metrics": {key: float(value) for key, value in metrics.items()},
         "loss_history": list(history),
     }
     (output_dir / f"metrics_epoch{epoch}.json").write_text(
@@ -281,6 +327,62 @@ def _integer_label_array(labels: np.ndarray) -> np.ndarray:
     except (TypeError, ValueError):
         _, encoded = np.unique(array.astype(str), return_inverse=True)
         return encoded.astype(np.int64, copy=False)
+
+
+def _configured_loss_coefficients(
+    config: Mapping[str, Any],
+) -> Tuple[float, float, float, float]:
+    loss = _section(config, "loss")
+    required = ("lambda_rec", "lambda_mgcl", "lambda_cluster", "lambda_spatial")
+    missing = [name for name in required if name not in loss]
+    if missing:
+        raise ValueError(
+            "Formal experiments must define all loss coefficients under loss: "
+            + ", ".join(missing)
+        )
+    coefficients = (
+        float(loss["lambda_rec"]),
+        float(loss["lambda_mgcl"]),
+        float(loss["lambda_cluster"]),
+        float(loss["lambda_spatial"]),
+    )
+    if not all(np.isfinite(value) and value >= 0 for value in coefficients):
+        raise ValueError("loss coefficients must be finite and nonnegative")
+    return coefficients
+
+
+def _assert_effective_loss_schedule(
+    actual: Tuple[float, float, float, float],
+    configured: Tuple[float, float, float, float],
+    *,
+    epoch_number: int,
+    warm_up_epochs: int,
+) -> None:
+    expected_cluster = (
+        0.0 if epoch_number <= warm_up_epochs else configured[2]
+    )
+    expected = (configured[0], configured[1], expected_cluster, configured[3])
+    if any(
+        not np.isclose(left, right, rtol=0.0, atol=0.0)
+        for left, right in zip(actual, expected)
+    ):
+        raise RuntimeError(
+            "Effective loss schedule differs from the configured protocol: "
+            f"epoch={epoch_number}, warm_up_epochs={warm_up_epochs}, "
+            f"actual={actual}, expected={expected}"
+        )
+
+
+def _nmi_average_method(config: Mapping[str, Any]) -> str:
+    method = str(
+        _section(config, "evaluation").get("nmi_average_method", "max")
+    ).lower()
+    if method not in {"min", "geometric", "arithmetic", "max"}:
+        raise ValueError(
+            "evaluation.nmi_average_method must be one of: "
+            "min, geometric, arithmetic, max"
+        )
+    return method
 
 
 def _embedding_from_output(output: Any, mode: str) -> torch.Tensor:
@@ -396,35 +498,32 @@ def _effective_loss_coefficients(
     spatial_start_epoch: Optional[int] = None,
     spatial_mechanism_enabled: bool = True,
 ) -> Tuple[float, float, float, float, bool, bool]:
-    loss = _section(config, "loss")
-    lambda_rec = float(loss.get("lambda_rec", config.get("lambda_rec", 1.0)))
-    lambda_mgcl = float(loss.get("lambda_mgcl", config.get("lambda_mgcl", 1.0)))
-    lambda_cluster = float(
-        loss.get("lambda_cluster", config.get("lambda_cluster", 1.0))
+    lambda_rec, lambda_mgcl, lambda_cluster, lambda_spatial = (
+        _configured_loss_coefficients(config)
     )
-    lambda_spatial = float(
-        loss.get("lambda_spatial", config.get("lambda_spatial", 0.0))
-    )
-    if min(lambda_rec, lambda_mgcl, lambda_cluster, lambda_spatial) < 0:
-        raise ValueError("loss coefficients must be nonnegative")
 
-    # Keep cluster activation and spatial regularization independently
-    # schedulable. The default preserves the old behavior, while P1 can
-    # delay spatial regularization to measure the MGCMVC structure first.
+    # Keep spatial regularization independently schedulable. The mechanism
+    # flag controls whether the spatial loss is computed; it does not rewrite
+    # the configured coefficient.
     if spatial_start_epoch is None:
         spatial_start_epoch = warm_up_epochs + 1
     if spatial_start_epoch < 1:
         raise ValueError("spatial_start_epoch must be positive")
 
+    # Warm-up pauses only the cluster-level term. Reconstruction and sample-
+    # level contrastive loss keep their configured coefficients throughout.
     cluster_enabled = epoch_number > warm_up_epochs
+    effective_lambda_cluster = (
+        lambda_cluster if cluster_enabled else 0.0
+    )
     spatial_enabled = (
         spatial_mechanism_enabled and epoch_number >= spatial_start_epoch
     )
     return (
         lambda_rec,
         lambda_mgcl,
-        lambda_cluster if cluster_enabled else 0.0,
-        lambda_spatial if spatial_enabled else 0.0,
+        effective_lambda_cluster,
+        lambda_spatial,
         cluster_enabled,
         spatial_enabled,
     )
@@ -481,6 +580,9 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
 
     _seed_everything(seed)
     device = _device_from_config(config)
+    configured_loss_coefficients = _configured_loss_coefficients(config)
+    nmi_average_method = _nmi_average_method(config)
+    _write_manifest(output_dir, config_path=config_path, device=device)
     sample = load_spatial_multiomics(
         data_root,
         dataset,
@@ -497,6 +599,20 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         )
         for modality, matrix in sample.modality_features.items()
     }
+    preprocessing_metadata = {}
+    for modality, matrix in features.items():
+        options = _preprocessing_options(config, modality)
+        preprocessing_metadata[modality] = {
+            "modality": modality,
+            "raw_shape": list(sample.modality_raw_shapes[modality]),
+            "model_input_shape": list(matrix.shape),
+            "matrix_source": matrix_source,
+            "n_pca_components": n_pca_components,
+            "pca_enabled": n_pca_components is not None,
+            "pca_whitening_enabled": n_pca_components is not None,
+            "log1p": bool(options.get("log1p", False)),
+            "standardize": bool(options.get("standardize", False)),
+        }
     modality_names = tuple(features)
     if len(modality_names) != 2:
         raise ValueError("SpaMGCL runner requires exactly two modalities")
@@ -522,6 +638,11 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
     default_cluster_count = int(np.unique(labels).size)
     model_cluster_count = _section(config, "model").get("num_clusters")
     clustering_cluster_count = clustering_config.get("n_clusters")
+    if model_cluster_count is None or clustering_cluster_count is None:
+        raise ValueError(
+            "Formal experiments must define both model.num_clusters and "
+            "clustering.n_clusters"
+        )
     configured_cluster_counts = [
         int(value)
         for value in (model_cluster_count, clustering_cluster_count)
@@ -575,11 +696,13 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
     )
 
     clustering_options = dict(clustering_config)
-    method = str(clustering_config.get("method", "kmeans"))
-    default_embedding = (
-        "cluster_probabilities" if method.lower() == "argmax" else "global"
-    )
-    embedding_mode = str(clustering_options.get("embedding", default_embedding))
+    method = str(clustering_config.get("method", "kmeans")).lower()
+    embedding_mode = str(clustering_options.get("embedding", "concat_z")).lower()
+    if method != "kmeans" or embedding_mode != "concat_z":
+        raise ValueError(
+            "Formal readout is fixed to clustering.method=kmeans and "
+            "clustering.embedding=concat_z; Q argmax is diagnostic only"
+        )
     milestone_epochs = {50, 100, 200}
     history = []
     cluster_head_init = str(training_config.get("cluster_head_init", "none")).lower()
@@ -602,6 +725,12 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             cluster_enabled,
             spatial_enabled,
         ) = coefficients
+        _assert_effective_loss_schedule(
+            (lambda_rec, lambda_mgcl, lambda_cluster, lambda_spatial),
+            configured_loss_coefficients,
+            epoch_number=epoch_number,
+            warm_up_epochs=warm_up_epochs,
+        )
         output = _model_forward(
             model,
             inputs,
@@ -618,6 +747,18 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             lambda_spatial=lambda_spatial,
         )
         total_loss = output.total_loss
+        expected_total = (
+            lambda_rec * output.reconstruction_loss
+            + lambda_mgcl * output.sample_contrastive_loss
+            + lambda_cluster * output.cluster_contrastive_loss
+            + lambda_spatial * output.spatial_loss
+        )
+        if not torch.isclose(total_loss, expected_total, rtol=1e-5, atol=1e-7):
+            raise RuntimeError(
+                f"total loss formula mismatch at epoch {epoch_number}: "
+                f"observed={float(total_loss.detach().cpu())}, "
+                f"expected={float(expected_total.detach().cpu())}"
+            )
         if not torch.isfinite(total_loss):
             raise FloatingPointError(f"non-finite total loss at epoch {epoch_number}")
         optimizer.zero_grad(set_to_none=True)
@@ -655,8 +796,11 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             "lambda_rec": lambda_rec,
             "lambda_mgcl": lambda_mgcl,
             "lambda_cluster": lambda_cluster,
+            "effective_lambda_cluster": lambda_cluster,
+            "configured_lambda_cluster": configured_loss_coefficients[2],
             "lambda_spatial": lambda_spatial,
             "cluster_enabled": cluster_enabled,
+            "warm_up_complete": epoch_number > warm_up_epochs,
             "spatial_enabled": spatial_enabled,
             "spatial_weighting_enabled": spatial_weighting_enabled,
             "spatial_negative_filter_enabled": spatial_negative_filter_enabled,
@@ -725,12 +869,17 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
                 method=method,
                 seed=seed,
             )
-            milestone_metrics = clustering_metrics(labels, milestone_predicted)
+            milestone_metrics = clustering_metrics(
+                labels,
+                milestone_predicted,
+                nmi_average_method=nmi_average_method,
+            )
             _write_metrics_snapshot(
                 output_dir,
                 epoch_number,
                 history,
                 milestone_metrics,
+                nmi_average_method=nmi_average_method,
             )
             _save_checkpoint(
                 output_dir / f"checkpoint_epoch{epoch_number}.pt",
@@ -757,11 +906,16 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             lambda_cluster=lambda_cluster,
             lambda_spatial=lambda_spatial,
         )
-    embedding = _embedding_from_output(final_output, embedding_mode).detach().cpu().numpy()
-    predicted, method_used = _cluster_embedding(
-        embedding, num_clusters, method=method, seed=seed
+    z_mean = _embedding_from_output(final_output, "mean_z").detach().cpu().numpy()
+    z_concat = _embedding_from_output(final_output, "concat_z").detach().cpu().numpy()
+    embedding = z_concat
+    pred_concat_z_kmeans, method_used = _cluster_embedding(
+        z_concat, num_clusters, method="kmeans", seed=seed
     )
-    metrics = clustering_metrics(labels, predicted)
+    predicted = pred_concat_z_kmeans
+    metrics = clustering_metrics(
+        labels, predicted, nmi_average_method=nmi_average_method
+    )
     candidate_metrics: Dict[str, Any] = {}
     for candidate_mode in (
         "global",
@@ -781,16 +935,21 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         )
         candidate_metrics[candidate_mode] = {
             "method": candidate_method,
-            **clustering_metrics(labels, candidate_predicted),
+            **clustering_metrics(
+                labels,
+                candidate_predicted,
+                nmi_average_method=nmi_average_method,
+            ),
         }
     Q = _mean_q(final_output)
     pred_labels = Q.argmax(dim=-1)
-    q_probabilities = Q.detach().cpu().numpy()
     q_predicted = pred_labels.detach().cpu().numpy().astype(np.int64, copy=False)
     q_method = "argmax"
     candidate_metrics["cluster_argmax"] = {
         "method": q_method,
-        **clustering_metrics(labels, q_predicted),
+        **clustering_metrics(
+            labels, q_predicted, nmi_average_method=nmi_average_method
+        ),
     }
     z_view_metrics: Dict[str, Any] = {}
     for view_name in model.view_order:
@@ -806,7 +965,9 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         z_view_metrics[view_name] = {
             "method": z_method,
             "dim": int(z_embedding.shape[1]),
-            **clustering_metrics(labels, z_predicted),
+            **clustering_metrics(
+                labels, z_predicted, nmi_average_method=nmi_average_method
+            ),
         }
     representation_metrics: Dict[str, Any] = {"z_views": z_view_metrics}
     for z_mode in ("mean_z", "concat_z"):
@@ -817,19 +978,43 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         representation_metrics[z_mode] = {
             "method": z_method,
             "dim": int(z_embedding.shape[1]),
-            **clustering_metrics(labels, z_predicted),
+            **clustering_metrics(
+                labels, z_predicted, nmi_average_method=nmi_average_method
+            ),
         }
     final_cluster_diagnostics = model.cluster_contrastive_loss.diagnostics(
         final_output.cluster_assignments
     )
 
     # Persist the exact arrays used by downstream reproducibility and plotting
-    # tools. ``embeddings`` follows the configured final clustering input;
-    # with the default argmax configuration this is mean(Q).
-    z_mean = _embedding_from_output(final_output, "mean_z").detach().cpu().numpy()
-    z_concat = _embedding_from_output(final_output, "concat_z").detach().cpu().numpy()
-    np.save(output_dir / "pred_labels.npy", q_predicted.astype(np.int64, copy=False))
-    np.save(output_dir / "gt_labels.npy", _integer_label_array(labels))
+    # tools. The official readout is always concat(Z_v) followed by KMeans;
+    # Q argmax is retained as a diagnostic partition only.
+    gt_labels = _integer_label_array(labels)
+    if not np.array_equal(predicted, pred_concat_z_kmeans):
+        raise RuntimeError("official predictions differ from concat_z KMeans")
+    if predicted.shape[0] != gt_labels.shape[0] or z_concat.shape[0] != gt_labels.shape[0]:
+        raise RuntimeError("prediction, embedding, and ground-truth lengths differ")
+    if not np.isfinite(z_concat).all():
+        raise RuntimeError("concat_z contains NaN or Inf")
+    if int(model_config["num_clusters"]) != int(clustering_config["n_clusters"]):
+        raise RuntimeError("model.num_clusters and clustering.n_clusters differ")
+    for modality, spot_ids in sample.modality_spot_ids.items():
+        if not np.array_equal(sample.spot_ids, spot_ids):
+            raise RuntimeError(f"spot order mismatch remains for modality {modality}")
+    recomputed_metrics = clustering_metrics(
+        gt_labels, predicted, nmi_average_method=nmi_average_method
+    )
+    for key in ("ARI", "NMI"):
+        if not np.isclose(metrics[key], recomputed_metrics[key], rtol=0.0, atol=1e-12):
+            raise RuntimeError(
+                f"saved prediction does not reproduce metrics[{key}]: "
+                f"{metrics[key]} != {recomputed_metrics[key]}"
+            )
+
+    np.save(output_dir / "pred_labels.npy", predicted.astype(np.int64, copy=False))
+    np.save(output_dir / "pred_concat_z_kmeans.npy", predicted.astype(np.int64, copy=False))
+    np.save(output_dir / "pred_q_argmax.npy", q_predicted.astype(np.int64, copy=False))
+    np.save(output_dir / "gt_labels.npy", gt_labels)
     np.save(output_dir / "spot_ids.npy", np.asarray(sample.spot_ids, dtype=str))
     np.save(
         output_dir / "coords.npy",
@@ -866,6 +1051,44 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         "spatial_mechanism_enabled": spatial_mechanism_enabled,
         "spatial_weighting_enabled": spatial_weighting_enabled,
         "spatial_negative_filter_enabled": spatial_negative_filter_enabled,
+        "nmi_average_method": nmi_average_method,
+        "official_readout": "concat_z + kmeans",
+        "cluster_warm_up_epochs": warm_up_epochs,
+        "cluster_loss_start_epoch": warm_up_epochs + 1,
+        "configured_loss": {
+            "lambda_rec": configured_loss_coefficients[0],
+            "lambda_mgcl": configured_loss_coefficients[1],
+            "lambda_cluster": configured_loss_coefficients[2],
+            "lambda_spatial": configured_loss_coefficients[3],
+        },
+        "resolved_parameters": {
+            "seed": seed,
+            "epochs": epochs,
+            "warm_up_epochs": warm_up_epochs,
+            "lr": learning_rate,
+            "weight_decay": weight_decay,
+            "cluster_head_lr_multiplier": cluster_head_multiplier,
+            "loss": {
+                "lambda_rec": configured_loss_coefficients[0],
+                "lambda_mgcl": configured_loss_coefficients[1],
+                "lambda_cluster": configured_loss_coefficients[2],
+                "lambda_spatial": configured_loss_coefficients[3],
+            },
+            "clustering": {
+                "method": method,
+                "embedding": embedding_mode,
+                "n_clusters": num_clusters,
+                "n_init": 20,
+            },
+        },
+        "resolved_loss_coefficients": {
+            "lambda_rec": configured_loss_coefficients[0],
+            "lambda_mgcl": configured_loss_coefficients[1],
+            "lambda_cluster": configured_loss_coefficients[2],
+            "lambda_spatial": configured_loss_coefficients[3],
+        },
+        "preprocessing": preprocessing_metadata,
+        "labels_used_for_training": False,
         "cluster_enabled_epochs": [
             record["epoch"] for record in history if record["cluster_enabled"]
         ],
@@ -897,6 +1120,8 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
         "loss_history": history,
         "artifacts": {
             "pred_labels": str(output_dir / "pred_labels.npy"),
+            "pred_concat_z_kmeans": str(output_dir / "pred_concat_z_kmeans.npy"),
+            "pred_q_argmax": str(output_dir / "pred_q_argmax.npy"),
             "gt_labels": str(output_dir / "gt_labels.npy"),
             "spot_ids": str(output_dir / "spot_ids.npy"),
             "coords": str(output_dir / "coords.npy"),
@@ -906,6 +1131,7 @@ def run_experiment(config_path: Path) -> Dict[str, Any]:
             "sc_weights": str(output_dir / "sc_weights.npy"),
             "snf_stats": str(output_dir / "snf_stats.json"),
             "checkpoint_last": str(output_dir / "checkpoint_last.pt"),
+            "manifest": str(output_dir / "manifest.json"),
         },
         "final_snf_stats": snf_stats,
     }

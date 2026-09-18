@@ -54,7 +54,12 @@ def cluster_embedding(
     return _kmeans(matrix, n_clusters, seed), "kmeans"
 
 
-def clustering_metrics(true_labels: Any, predicted_labels: Any) -> Dict[str, float]:
+def clustering_metrics(
+    true_labels: Any,
+    predicted_labels: Any,
+    *,
+    nmi_average_method: str = "max",
+) -> Dict[str, float]:
     from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
 
     true_array = np.asarray(true_labels)
@@ -65,7 +70,9 @@ def clustering_metrics(true_labels: Any, predicted_labels: Any) -> Dict[str, flo
         "ARI": float(adjusted_rand_score(true_array, predicted_array)),
         "NMI": float(
             normalized_mutual_info_score(
-                true_array, predicted_array, average_method="max"
+                true_array,
+                predicted_array,
+                average_method=nmi_average_method,
             )
         ),
     }
